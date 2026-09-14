@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.next/
+.env
+.env.local
+*.log
+*.tsbuildinfo
+.DS_Store
+
+# Local-only project docs (planning brief, learnings, codebase map) — kept
+# for local reference, deliberately not published to the public repo.
+CLAUDE.md
+LEARNINGS.md
+ARCHITECTURE.md

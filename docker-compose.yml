@@ -1,0 +1,35 @@
+# Development infrastructure only — the datastores, not our app code.
+#
+# We run the API, dashboard, bot, and worker on the host (fast reloads,
+# working debugger) and let Docker own the one thing that's actually needed
+# locally: Redis, for BullMQ (see `redis` below). Eventually `api`, `web`,
+# `bot`, and `worker` services get added here too, and this same file
+# becomes the production deploy artifact.
+services:
+  # NOT what the app actually uses — we run against MongoDB Atlas. This service is a documented, ready-to-use fallback if
+  # we ever want the self-hosting exercise for its own sake. `docker compose
+  # up -d` does NOT start this — only `redis` is needed day to day.
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - '27017:27017'
+    volumes:
+      # Named volume, so data survives `docker compose down`. Without this,
+      # every restart wipes your goals.
+      - mongo-data:/data/db
+
+  redis:
+    # Actively used — BullMQ's job queue for the scheduler (reminders,
+    # follow-ups, the reconciliation sweep). Start with:
+    #   docker compose up -d redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+
+volumes:
+  mongo-data:
+  redis-data:
