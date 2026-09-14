@@ -19,6 +19,7 @@ import {
 import { GoalModel } from './models/Goal.js';
 import { UserModel } from './models/User.js';
 import { CheckInModel } from './models/CheckIn.js';
+import { generateReminderMessage, type CheckInHistoryEntry } from './lib/ai.js';
 import {
   checkInButtons,
   sendTelegramMessage,
@@ -64,6 +65,21 @@ function minutesLate(scheduledHHMM: string, nowHHMM: string): number {
   const [sh, sm] = scheduledHHMM.split(':').map(Number);
   const [nh, nm] = nowHHMM.split(':').map(Number);
   return nh! * 60 + nm! - (sh! * 60 + sm!);
+}
+
+/** Last 7 calendar days for one goal, oldest first — context for the AI layer. */
+async function recentHistoryFor(goalId: string, timezone: string): Promise<CheckInHistoryEntry[]> {
+  const today = localDateInZone(timezone);
+  const weekAgo = new Date();
+  weekAgo.setDate(weekAgo.getDate() - 7);
+  const from = localDateInZone(timezone, weekAgo);
+
+  const checkIns = await CheckInModel.find({ goalId, date: { $gte: from, $lte: today } })
+    .select('date status')
+    .sort({ date: 1 })
+    .lean();
+
+  return checkIns.map((c) => ({ date: c.date, status: c.status }));
 }
 
 // ---------------------------------------------------------------------------
@@ -126,13 +142,24 @@ async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
     jobId: followupJobIdFor(goalId, date),
   });
 
+  // The header (title, time) is ALWAYS this exact deterministic line, straight
+  // from Mongo — never AI-generated. Only the second line is ever allowed to
+  // come from the model, and a failure there degrades to the same static
+  // text this feature shipped with, never to a broken or missing reminder.
+  const aiLine = await generateReminderMessage({
+    goalTitle: goal.title,
+    target: goal.target,
+    targetUnit: goal.targetUnit,
+    recentHistory: await recentHistoryFor(goalId, user.timezone),
+  });
+
   await sendTelegramMessage(
     user.telegramChatId,
-    `⏰ ${goal.title} — ${formatTimeOfDay(goal.cadence.timeOfDay)}\n\nTap when you've done it.`,
+    `⏰ ${goal.title} — ${formatTimeOfDay(goal.cadence.timeOfDay)}\n\n${aiLine ?? "Tap when you've done it."}`,
     checkInButtons(goalId, date),
   );
 
-  return 'sent';
+  return aiLine ? 'sent (ai)' : 'sent (template)';
 }
 
 // ---------------------------------------------------------------------------
