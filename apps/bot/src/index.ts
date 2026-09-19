@@ -1,5 +1,13 @@
 import { Telegraf, Markup, type Context } from 'telegraf';
-import { formatTimeOfDay, type Goal, type CheckIn, type User, type CheckInStatus } from '@coach/shared';
+import { message } from 'telegraf/filters';
+import {
+  formatTimeOfDay,
+  type Goal,
+  type CheckIn,
+  type User,
+  type CheckInStatus,
+  type AssistantAskResponse,
+} from '@coach/shared';
 import { env } from './env.js';
 import { api, NotLinkedError, ApiRequestError } from './api.js';
 
@@ -176,8 +184,14 @@ bot.command('skip', makeCheckInCommand('skipped'));
  * Note this handler never cares which process sent the message. The worker
  * sends, Telegram delivers the press to whichever process is polling (this
  * one), and this code handles it.
+ *
+ * The goal id is a uuid (8-4-4-4-12 hex digits). Telegram caps callback data
+ * at 64 bytes; the longest payload, "coach:skipped:<uuid>:<date>", is 61.
  */
-bot.action(/^coach:(done|skipped):([a-f0-9]{24})(?::(\d{4}-\d{2}-\d{2}))?$/, async (ctx) => {
+const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+const CHECK_IN_BUTTON = new RegExp(`^coach:(done|skipped):(${UUID})(?::(\\d{4}-\\d{2}-\\d{2}))?$`);
+
+bot.action(CHECK_IN_BUTTON, async (ctx) => {
   const chatId = chatIdOf(ctx);
   const status = ctx.match[1] as CheckInStatus;
   const goalId = ctx.match[2];
@@ -196,7 +210,7 @@ bot.action(/^coach:(done|skipped):([a-f0-9]{24})(?::(\d{4}-\d{2}-\d{2}))?$/, asy
     console.error('[bot] check-in button failed:', err);
     // Best-effort only. If the FIRST answerCbQuery above failed because the
     // callback query itself is expired (e.g. the bot wasn't running when the
-    // button was tapped — see LEARNINGS), this second attempt will fail for
+    // button was tapped), this second attempt will fail for
     // the exact same reason. Without `.catch(() => {})` here, that second
     // failure goes uncaught and crashes the whole bot process — for every
     // user, over one stale tap from one person.
@@ -218,6 +232,30 @@ async function replyForError(ctx: { reply: (text: string) => Promise<unknown> },
   console.error('[bot] error:', err);
   await ctx.reply('Something went wrong. Try again in a moment.');
 }
+
+/**
+ * Anything that isn't a recognised command falls through to here — this is
+ * registered LAST, deliberately, since Telegraf runs middleware in
+ * registration order and every `bot.command(...)` above only handles its own
+ * command, letting anything else pass through via an implicit `next()`.
+ * A command that WOULD match one of the handlers above never reaches this
+ * one; only genuine free text does.
+ *
+ * `message('text')` is Telegraf's filter for "this update is a text
+ * message" — narrows `ctx` so `ctx.message.text` is safe to read without an
+ * `if` check.
+ */
+bot.on(message('text'), async (ctx) => {
+  const chatId = chatIdOf(ctx);
+  try {
+    const { reply } = await api.post<AssistantAskResponse>('/assistant/ask', chatId, {
+      message: ctx.message.text,
+    });
+    await ctx.reply(reply);
+  } catch (err) {
+    await replyForError(ctx, err);
+  }
+});
 
 // Telegraf's own catch-all: anything that slips past a handler's own
 // try/catch lands here and gets logged, instead of becoming an unhandled

@@ -1,8 +1,11 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { verifyToken } from '../lib/jwt.js';
+import { eq } from 'drizzle-orm';
 import { env } from '../lib/env.js';
-import { UserModel } from '../models/User.js';
+import { isUuid } from '../lib/validators.js';
+import { db } from '../db/client.js';
+import { users } from '../db/schema.js';
 
 /**
  * Teach TypeScript that an authenticated request carries a userId. Express's
@@ -19,7 +22,7 @@ declare global {
 }
 
 /** Constant-time compare, so a wrong secret can't be guessed byte-by-byte. */
-function secretMatches(provided: string, expected: string): boolean {
+export function secretMatches(provided: string, expected: string): boolean {
   const a = Buffer.from(provided);
   const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
@@ -57,6 +60,11 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   if (header?.startsWith('Bearer ')) {
     try {
       const payload = await verifyToken(header.slice('Bearer '.length), env.jwtSecret);
+      // A validly SIGNED token can still carry an id from an older format
+      // (tokens issued before the move to Postgres held Mongo ObjectIds).
+      // Rejecting it here as an invalid token logs the client out cleanly,
+      // instead of every query later failing on a malformed uuid.
+      if (!payload.sub || !isUuid(payload.sub)) throw new Error('token subject is not a uuid');
       req.userId = payload.sub;
       next();
       return;
@@ -77,7 +85,12 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       return;
     }
 
-    const user = await UserModel.findOne({ telegramChatId: chatId });
+    // SELECT id FROM users WHERE telegram_chat_id = $1
+    // Only the id is needed, so only the id is fetched.
+    const [user] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.telegramChatId, chatId));
     if (!user) {
       // Distinct from 401 on purpose: the BOT authenticated fine, it's the
       // end user who hasn't linked an account yet. The bot turns this into
@@ -86,7 +99,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       return;
     }
 
-    req.userId = user._id.toString();
+    req.userId = user.id;
     next();
     return;
   }

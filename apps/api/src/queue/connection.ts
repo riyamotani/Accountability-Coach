@@ -35,7 +35,7 @@ import { env } from '../lib/env.js';
  *      with all of them on recovery.
  *   2. Failures show up in the logs the moment they happen.
  * Dropping those commands is safe only because the reconciliation sweep
- * rebuilds every schedule from Mongo regardless.
+ * rebuilds every schedule from Postgres regardless.
  *
  * Created at import time because every process that imports the queue needs it.
  */

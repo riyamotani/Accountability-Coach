@@ -1,12 +1,14 @@
 import express, { type NextFunction, type Request, type Response } from 'express';
 import cors from 'cors';
-import mongoose from 'mongoose';
 import { env } from './lib/env.js';
+import { pool } from './db/client.js';
+import { describeError } from './db/errors.js';
 import { authRouter } from './routes/auth.js';
 import { goalsRouter } from './routes/goals.js';
 import { checkInsRouter } from './routes/checkins.js';
 import { scheduleRouter } from './routes/schedule.js';
 import { telegramRouter } from './routes/telegram.js';
+import { assistantRouter } from './routes/assistant.js';
 
 export function createApp() {
   const app = express();
@@ -19,8 +21,14 @@ export function createApp() {
 
   app.use(express.json({ limit: '100kb' }));
 
-  app.get('/health', (_req, res) => {
-    res.json({ ok: true, db: mongoose.connection.readyState === 1 });
+  app.get('/health', async (_req, res) => {
+    // Actually asks the database, rather than trusting a cached "connected"
+    // flag: a pool can hold connections to a server that has since gone away.
+    const db = await pool.query('SELECT 1').then(
+      () => true,
+      () => false,
+    );
+    res.json({ ok: true, db });
   });
 
   app.use('/auth', authRouter);
@@ -28,6 +36,7 @@ export function createApp() {
   app.use('/checkins', checkInsRouter);
   app.use('/schedule', scheduleRouter);
   app.use('/telegram', telegramRouter);
+  app.use('/assistant', assistantRouter);
 
   app.use((_req, res) => {
     res.status(404).json({ error: 'Not found' });
@@ -50,7 +59,9 @@ export function createApp() {
         ? err.status
         : 500;
 
-    if (status >= 500) console.error('[api] unhandled error:', err);
+    // describeError keeps query parameters (password hashes, notes) out of
+    // the log for failed database queries.
+    if (status >= 500) console.error('[api] unhandled error:', describeError(err));
     res.status(status).json({ error: status < 500 ? 'Malformed request' : 'Internal server error' });
   });
 
@@ -58,8 +69,11 @@ export function createApp() {
 }
 
 async function main() {
-  await mongoose.connect(env.mongoUri);
-  console.log('[api] mongo connected');
+  // The pool connects lazily, on the first query. Running one now means a
+  // wrong DATABASE_URL or a stopped container fails at startup, not on the
+  // first user's request.
+  await pool.query('SELECT 1');
+  console.log('[api] postgres connected');
 
   createApp().listen(env.port, () => {
     console.log(`[api] listening on http://localhost:${env.port}`);

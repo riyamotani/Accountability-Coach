@@ -5,7 +5,7 @@ import { env } from './env.js';
  *
  * The Telegram Bot API is just HTTPS: POST to
  * https://api.telegram.org/bot<TOKEN>/<method> with a JSON body. Telegraf is a
- * convenience layer over exactly this (see LEARNINGS §11). The worker only
+ * convenience layer over exactly this. The worker only
  * ever SENDS, so pulling in a whole bot framework to make one HTTP call would
  * be the tail wagging the dog.
  *
@@ -31,7 +31,8 @@ export class TelegramPermanentError extends Error {}
  * parses this back out — the bot handles presses on messages the worker sent.
  *
  * Size check against Telegram's 64-byte callback_data limit:
- * "coach:skipped:" (14) + 24-char ObjectId + ":" + "YYYY-MM-DD" (11) = 49. Fits.
+ * "coach:skipped:" (14) + 36-char uuid + ":" + "YYYY-MM-DD" (11) = 61. Fits,
+ * with 3 bytes to spare — so there's no room to add anything else here.
  */
 export function checkInButtons(goalId: string, date: string): InlineButton[][] {
   return [

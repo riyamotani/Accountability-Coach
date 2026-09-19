@@ -28,10 +28,10 @@ export interface CheckInHistoryEntry {
 
 export interface ReminderContext {
   goalTitle: string;
-  // `| undefined` alongside `?:` — Mongoose types an optional field as
-  // `T | null | undefined`, and exactOptionalPropertyTypes distinguishes
-  // "key absent" from "key present with value undefined". Passing
-  // goal.target straight through needs both spellings accepted.
+  // `| null | undefined` alongside `?:` — a nullable column arrives as `null`,
+  // and exactOptionalPropertyTypes distinguishes "key absent" from "key
+  // present with value undefined". Accepting every spelling lets a caller
+  // pass goal.target straight through.
   target?: number | null | undefined;
   targetUnit?: string | null | undefined;
   /** Last ~7 days, oldest first. Empty is fine — a brand new goal has none. */
@@ -82,9 +82,8 @@ export function buildPrompt(ctx: ReminderContext): string {
 let gateway: ReturnType<typeof createGateway> | null = null;
 
 export async function generateReminderMessage(ctx: ReminderContext): Promise<string | null> {
-  // Fail closed with zero network activity when no key is configured. This is
-  // the current, temporary, pre-BYO-key state (see CLAUDE.md): the caller just
-  // gets its plain template, silently.
+  // Fail closed with zero network activity when no key is configured: the
+  // caller just gets its plain template, silently.
   if (!env.aiGatewayApiKey) return null;
 
   gateway ??= createGateway({ apiKey: env.aiGatewayApiKey });

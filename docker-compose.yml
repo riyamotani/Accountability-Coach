@@ -1,23 +1,42 @@
 # Development infrastructure only — the datastores, not our app code.
 #
 # We run the API, dashboard, bot, and worker on the host (fast reloads,
-# working debugger) and let Docker own the one thing that's actually needed
-# locally: Redis, for BullMQ (see `redis` below). Eventually `api`, `web`,
-# `bot`, and `worker` services get added here too, and this same file
-# becomes the production deploy artifact.
+# working debugger) and let Docker own the datastores: Postgres and Redis.
+# Eventually `api`, `web`, `bot`, and `worker` services get added here too,
+# and this same file becomes the production deploy artifact.
+#
+# Start both with:  docker compose up -d
 services:
-  # NOT what the app actually uses — we run against MongoDB Atlas. This service is a documented, ready-to-use fallback if
-  # we ever want the self-hosting exercise for its own sake. `docker compose
-  # up -d` does NOT start this — only `redis` is needed day to day.
-  mongo:
-    image: mongo:7
+  postgres:
+    # Plain Postgres with the pgvector extension pre-installed. The official
+    # `postgres` image doesn't include pgvector, and adding it by hand means
+    # compiling it — this image saves that step.
+    image: pgvector/pgvector:pg17
     restart: unless-stopped
+    environment:
+      # Local-development credentials only. They're in a public file, which
+      # is fine for a database that only listens on your own machine — never
+      # reuse them for anything reachable from the internet.
+      POSTGRES_USER: coach
+      POSTGRES_PASSWORD: coach
+      POSTGRES_DB: coach
     ports:
-      - '27017:27017'
+      # "host:container". Inside the container Postgres listens on its usual
+      # 5432; on your machine it's exposed as 5433, so it can't collide with a
+      # Postgres installed directly on the machine (which takes 5432 and
+      # would silently receive our connections instead). DATABASE_URL uses
+      # 5433 to match.
+      - '5433:5432'
     volumes:
-      # Named volume, so data survives `docker compose down`. Without this,
-      # every restart wipes your goals.
-      - mongo-data:/data/db
+      # Named volume, so data survives `docker compose down`.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Lets Docker report "healthy" once Postgres actually accepts
+      # connections, rather than just "the container started".
+      test: ['CMD-SHELL', 'pg_isready -U coach -d coach']
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     # Actively used — BullMQ's job queue for the scheduler (reminders,
@@ -31,5 +50,5 @@ services:
       - redis-data:/data
 
 volumes:
-  mongo-data:
+  postgres-data:
   redis-data:

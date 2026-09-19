@@ -2,7 +2,8 @@ import type { ApiError } from '@coach/shared';
 import { env } from './env.js';
 
 /**
- * The bot's client for our own API. Note what it does NOT do: talk to Mongo.
+ * The bot's client for our own API. Note what it does NOT do: talk to the
+ * database.
  *
  * The bot is a client of the same REST API the dashboard uses — it has no
  * database access of its own. That's the payoff of the kickoff decision to
@@ -56,6 +57,9 @@ async function request<T>(path: string, chatId: string, options: RequestInit = {
 
 export const api = {
   get: <T>(path: string, chatId: string) => request<T>(path, chatId),
+
+  post: <T>(path: string, chatId: string, body: unknown) =>
+    request<T>(path, chatId, { method: 'POST', body: JSON.stringify(body) }),
 
   put: <T>(path: string, chatId: string, body: unknown) =>
     request<T>(path, chatId, { method: 'PUT', body: JSON.stringify(body) }),

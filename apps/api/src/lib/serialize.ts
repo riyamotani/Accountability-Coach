@@ -1,64 +1,66 @@
 import type { User, Goal, CheckIn, ScheduleBlock } from '@coach/shared';
-import type { UserDoc } from '../models/User.js';
-import type { GoalDoc } from '../models/Goal.js';
-import type { CheckInDoc } from '../models/CheckIn.js';
-import type { ScheduleBlockDoc } from '../models/ScheduleBlock.js';
+import type { CheckInRow, GoalRow, ScheduleBlockRow, UserRow } from '../db/schema.js';
 
 /**
- * The boundary between "what Mongo stores" and "what the API returns".
+ * The boundary between "what the database stores" and "what the API returns".
  *
- * Without this layer, `res.json(userDoc)` would happily ship `passwordHash`,
- * `__v`, and raw ObjectIds to the browser. Mapping explicitly means a new
- * sensitive field added to a schema is invisible to clients until someone
- * deliberately adds it here — the safe default is "not exposed".
+ * Without this layer, `res.json(userRow)` would happily ship `passwordHash` to
+ * the browser. Mapping explicitly means a new sensitive column added to the
+ * schema is invisible to clients until someone deliberately adds it here —
+ * the safe default is "not exposed".
+ *
+ * Optional columns come back from Postgres as `null`. The API's shared types
+ * express "not set" by leaving the field out, so nulls are dropped here.
  */
 
-export function toUser(doc: UserDoc): User {
+export function toUser(row: UserRow): User {
   return {
-    id: doc._id.toString(),
-    email: doc.email,
-    displayName: doc.displayName,
-    timezone: doc.timezone,
-    ...(doc.telegramChatId ? { telegramChatId: doc.telegramChatId } : {}),
-    createdAt: doc.createdAt.toISOString(),
+    id: row.id,
+    email: row.email,
+    displayName: row.displayName,
+    timezone: row.timezone,
+    ...(row.telegramChatId ? { telegramChatId: row.telegramChatId } : {}),
+    createdAt: row.createdAt.toISOString(),
   };
 }
 
-export function toGoal(doc: GoalDoc): Goal {
+export function toGoal(row: GoalRow): Goal {
   return {
-    id: doc._id.toString(),
-    ownerId: doc.ownerId.toString(),
-    title: doc.title,
-    ...(doc.description ? { description: doc.description } : {}),
-    cadence: { daysOfWeek: [...doc.cadence.daysOfWeek], timeOfDay: doc.cadence.timeOfDay },
-    ...(doc.target != null ? { target: doc.target } : {}),
-    ...(doc.targetUnit ? { targetUnit: doc.targetUnit } : {}),
-    status: doc.status,
-    createdAt: doc.createdAt.toISOString(),
+    id: row.id,
+    ownerId: row.ownerId,
+    title: row.title,
+    ...(row.description ? { description: row.description } : {}),
+    // Stored as two columns, returned as the one `cadence` object the API has
+    // always exposed. Clients never learn the table layout changed.
+    cadence: { daysOfWeek: [...row.daysOfWeek], timeOfDay: row.timeOfDay },
+    ...(row.target != null ? { target: row.target } : {}),
+    ...(row.targetUnit ? { targetUnit: row.targetUnit } : {}),
+    status: row.status,
+    createdAt: row.createdAt.toISOString(),
   };
 }
 
-export function toScheduleBlock(doc: ScheduleBlockDoc): ScheduleBlock {
+export function toScheduleBlock(row: ScheduleBlockRow): ScheduleBlock {
   return {
-    id: doc._id.toString(),
-    ownerId: doc.ownerId.toString(),
-    label: doc.label,
-    startTime: doc.startTime,
-    endTime: doc.endTime,
-    daysOfWeek: [...doc.daysOfWeek],
-    createdAt: doc.createdAt.toISOString(),
+    id: row.id,
+    ownerId: row.ownerId,
+    label: row.label,
+    startTime: row.startTime,
+    endTime: row.endTime,
+    daysOfWeek: [...row.daysOfWeek],
+    createdAt: row.createdAt.toISOString(),
   };
 }
 
-export function toCheckIn(doc: CheckInDoc): CheckIn {
+export function toCheckIn(row: CheckInRow): CheckIn {
   return {
-    id: doc._id.toString(),
-    goalId: doc.goalId.toString(),
-    ownerId: doc.ownerId.toString(),
-    date: doc.date,
-    status: doc.status,
-    ...(doc.value != null ? { value: doc.value } : {}),
-    ...(doc.note ? { note: doc.note } : {}),
-    createdAt: doc.createdAt.toISOString(),
+    id: row.id,
+    goalId: row.goalId,
+    ownerId: row.ownerId,
+    date: row.date,
+    status: row.status,
+    ...(row.value != null ? { value: row.value } : {}),
+    ...(row.note ? { note: row.note } : {}),
+    createdAt: row.createdAt.toISOString(),
   };
 }

@@ -27,7 +27,8 @@ function required(name: string): string {
 
 export const env = {
   port: Number(process.env.PORT ?? 4000),
-  mongoUri: process.env.MONGO_URI ?? 'mongodb://127.0.0.1:27017/coach',
+  // postgresql://USER:PASSWORD@HOST:PORT/DATABASE
+  databaseUrl: required('DATABASE_URL'),
   jwtSecret: required('JWT_SECRET'),
   jwtTtlSeconds: Number(process.env.JWT_TTL_SECONDS ?? 60 * 60 * 24 * 7), // 7 days
   webOrigin: process.env.WEB_ORIGIN ?? 'http://localhost:3000',

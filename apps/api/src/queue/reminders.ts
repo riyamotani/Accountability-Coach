@@ -1,8 +1,9 @@
 import { Queue } from 'bullmq';
+import { eq } from 'drizzle-orm';
 import { queueConnection } from './connection.js';
 import { env } from '../lib/env.js';
-import { UserModel } from '../models/User.js';
-import { GoalModel, type GoalDoc } from '../models/Goal.js';
+import { db } from '../db/client.js';
+import { goals, users, type GoalRow } from '../db/schema.js';
 
 export const QUEUE_NAME = 'reminders';
 
@@ -62,10 +63,10 @@ const MAX_FOLLOWUP_MS = 3 * 60 * 60 * 1000; // 3 hours
  *     TIME unit, so there's nothing to multiply into minutes.
  * Both land here rather than crashing or guessing.
  */
-// `| null`, not just `?`, because Mongoose types an optional numeric/string
-// field as `T | null | undefined` — it uses `null` for "not set", not just
-// absence. Under exactOptionalPropertyTypes, `target?: number` only permits
-// "absent or a number", which rejects the real GoalDoc shape at the call site.
+// `| null`, not just `?`, because an optional (nullable) column comes back
+// from Postgres as `null` for "not set". Under exactOptionalPropertyTypes,
+// `target?: number` only permits "absent or a number", which would reject a
+// real goal row at the call site.
 export function followupDelayMsFor(goal: {
   target?: number | null;
   targetUnit?: string | null;
@@ -116,7 +117,7 @@ export function cronPatternFor(cadence: { daysOfWeek: number[]; timeOfDay: strin
  * plus the timezone it's evaluated in.
  *
  * It's stamped into every job when the schedule is created, and recomputed
- * from Mongo when the job fires. If the two differ, the job is stale (the
+ * from the database when the job fires. If the two differ, the job is stale (the
  * goal was edited, or the user changed timezone) and must not send. This is an
  * EXACT comparison — no "roughly the same time" tolerance to tune or get wrong.
  */
@@ -146,7 +147,7 @@ export const RETRY_OPTS = {
 } as const;
 
 /**
- * Make BullMQ's schedule for this goal match what Mongo says. Safe to call any
+ * Make BullMQ's schedule for this goal match what Postgres says. Safe to call any
  * number of times — that idempotency is the whole design:
  *
  *   - the normal path calls it after every goal save
@@ -154,23 +155,26 @@ export const RETRY_OPTS = {
  *   - running it when nothing changed is a no-op
  *
  * It NEVER throws. The API calls this without awaiting it, and a Redis failure
- * must not become a failed HTTP request: Mongo already has the truth, and the
+ * must not become a failed HTTP request: Postgres already has the truth, and the
  * reconciliation sweep will repair the schedule. That's the answer to the
  * dual-write problem — don't pretend both writes are atomic; make the second
  * one retryable and the failure harmless.
  */
-export async function syncGoalSchedule(goal: GoalDoc): Promise<void> {
-  const goalId = goal._id.toString();
+export async function syncGoalSchedule(goal: GoalRow): Promise<void> {
+  const goalId = goal.id;
   try {
     if (goal.status !== 'active') {
       await reminderQueue.removeJobScheduler(schedulerIdFor(goalId));
       return;
     }
 
-    const user = await UserModel.findById(goal.ownerId).select('timezone');
+    const [user] = await db
+      .select({ timezone: users.timezone })
+      .from(users)
+      .where(eq(users.id, goal.ownerId));
     if (!user) return;
 
-    const pattern = cronPatternFor(goal.cadence);
+    const pattern = cronPatternFor(goal);
 
     await reminderQueue.upsertJobScheduler(
       schedulerIdFor(goalId),
@@ -213,6 +217,6 @@ export async function removeGoalSchedule(goalId: string): Promise<void> {
  * keep firing in the old zone until the next reconciliation pass.
  */
 export async function resyncUserGoals(userId: string): Promise<void> {
-  const goals = await GoalModel.find({ ownerId: userId });
-  await Promise.all(goals.map(syncGoalSchedule));
+  const rows = await db.select().from(goals).where(eq(goals.ownerId, userId));
+  await Promise.all(rows.map(syncGoalSchedule));
 }

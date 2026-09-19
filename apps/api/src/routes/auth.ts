@@ -1,7 +1,10 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import { UserModel } from '../models/User.js';
+import { eq } from 'drizzle-orm';
+import { db } from '../db/client.js';
+import { users } from '../db/schema.js';
+import { PG_UNIQUE_VIOLATION, pgErrorCode } from '../db/errors.js';
 import { createToken } from '../lib/jwt.js';
 import { env } from '../lib/env.js';
 import { toUser } from '../lib/serialize.js';
@@ -18,10 +21,15 @@ export const authRouter = Router();
  */
 const BCRYPT_ROUNDS = 12;
 
+// `.toLowerCase()` here, because the database has a CHECK that rejects any
+// email that isn't already lowercase. Normalizing at the edge means
+// "Riya@x.com" and "riya@x.com" are one account, not two.
+const email = z.string().email().transform((e) => e.trim().toLowerCase());
+
 const registerSchema = z.object({
-  email: z.string().email(),
+  email,
   password: z.string().min(8).max(200),
-  displayName: z.string().min(1).max(100),
+  displayName: z.string().trim().min(1).max(100),
   timezone: timezoneSchema,
 });
 
@@ -38,23 +46,31 @@ authRouter.post('/register', async (req, res) => {
 
   let user;
   try {
-    user = await UserModel.create({ email, passwordHash, displayName, timezone });
+    // INSERT INTO users (...) VALUES (...) RETURNING *
+    // RETURNING hands back the row as stored, including the id and
+    // created_at the database generated, so no second query is needed.
+    [user] = await db
+      .insert(users)
+      .values({ email, passwordHash, displayName, timezone })
+      .returning();
   } catch (err) {
-    // 11000 is Mongo's duplicate-key error. We let the unique index decide
-    // rather than doing a findOne-then-insert, which races.
-    if ((err as { code?: number }).code === 11000) {
+    // The UNIQUE constraint on email decides, rather than a
+    // look-then-insert, which races: two signups with the same email at the
+    // same moment would both see "not taken".
+    if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
       res.status(409).json({ error: 'Email already registered' });
       return;
     }
     throw err;
   }
+  if (!user) throw new Error('INSERT ... RETURNING returned no row');
 
-  const token = await createToken(user._id.toString(), env.jwtSecret, env.jwtTtlSeconds);
+  const token = await createToken(user.id, env.jwtSecret, env.jwtTtlSeconds);
   res.status(201).json({ token, user: toUser(user) });
 });
 
 const loginSchema = z.object({
-  email: z.string().email(),
+  email,
   password: z.string(),
 });
 
@@ -65,7 +81,10 @@ authRouter.post('/login', async (req, res) => {
     return;
   }
 
-  const user = await UserModel.findOne({ email: parsed.data.email });
+  // SELECT * FROM users WHERE email = $1
+  // A query always returns a LIST of rows; `[user]` takes the first one, or
+  // `undefined` if there were none.
+  const [user] = await db.select().from(users).where(eq(users.email, parsed.data.email));
 
   // Deliberately identical response for "no such user" and "wrong password".
   // Distinguishing them turns the login form into an account-enumeration
@@ -76,13 +95,13 @@ authRouter.post('/login', async (req, res) => {
     return;
   }
 
-  const token = await createToken(user._id.toString(), env.jwtSecret, env.jwtTtlSeconds);
+  const token = await createToken(user.id, env.jwtSecret, env.jwtTtlSeconds);
   res.json({ token, user: toUser(user) });
 });
 
 /** Who am I? Used by the dashboard to restore a session from a stored token. */
 authRouter.get('/me', requireAuth, async (req, res) => {
-  const user = await UserModel.findById(req.userId);
+  const [user] = await db.select().from(users).where(eq(users.id, req.userId!));
   if (!user) {
     res.status(404).json({ error: 'User not found' });
     return;
@@ -91,7 +110,7 @@ authRouter.get('/me', requireAuth, async (req, res) => {
 });
 
 const updateProfileSchema = z.object({
-  displayName: z.string().min(1).max(100).optional(),
+  displayName: z.string().trim().min(1).max(100).optional(),
   timezone: timezoneSchema.optional(),
 });
 
@@ -113,11 +132,20 @@ authRouter.patch('/me', requireAuth, async (req, res) => {
     res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
     return;
   }
+  const { displayName, timezone } = parsed.data;
 
-  const user = await UserModel.findByIdAndUpdate(req.userId, parsed.data, {
-    new: true,
-    runValidators: true,
-  });
+  // UPDATE users SET ... WHERE id = $1 RETURNING *
+  // Only fields that were actually sent go into SET; updatedAt is always
+  // included, which also keeps SET from ever being empty (invalid SQL).
+  const [user] = await db
+    .update(users)
+    .set({
+      ...(displayName !== undefined ? { displayName } : {}),
+      ...(timezone !== undefined ? { timezone } : {}),
+      updatedAt: new Date(),
+    })
+    .where(eq(users.id, req.userId!))
+    .returning();
   if (!user) {
     res.status(404).json({ error: 'User not found' });
     return;
@@ -126,7 +154,7 @@ authRouter.patch('/me', requireAuth, async (req, res) => {
   // "7:15" in a new timezone is a different instant, so every one of this
   // user's schedules just went stale at once. Re-point them now rather than
   // leaving them firing in the old zone until the next reconciliation sweep.
-  if (parsed.data.timezone) void resyncUserGoals(user._id.toString());
+  if (timezone) void resyncUserGoals(user.id);
 
   res.json(toUser(user));
 });

@@ -2,10 +2,10 @@
  * The domain vocabulary, defined once and shared by the API, the dashboard,
  * and (later) the Telegram bot and the BullMQ worker.
  *
- * These are transport types — the shape of JSON crossing the wire. Ids are
- * strings here, not Mongo ObjectIds, because by the time data leaves the API
- * it has already been serialized. Mongoose has its own document types on the
- * server side; this file is what everyone else agrees on.
+ * These are transport types — the shape of JSON crossing the wire. The
+ * database's own row types live on the server (inferred from the Drizzle
+ * schema) and are mapped to these before anything is sent; this file is what
+ * everyone else agrees on. Ids are uuid strings.
  */
 
 export type Id = string;
@@ -165,6 +165,44 @@ export interface CreateScheduleBlockBody {
 }
 
 export type UpdateScheduleBlockBody = Partial<CreateScheduleBlockBody>;
+
+// ---------------------------------------------------------------------------
+// PauseWindow — "on vacation, don't disturb me"
+// ---------------------------------------------------------------------------
+
+/**
+ * A date range where the scheduler should stay silent for this user. Checked
+ * by the worker before every reminder fires. A paused day is neither `done`
+ * nor `skipped`: no CheckIn row
+ * gets written for a paused day at all; it's simply excluded from whatever
+ * later counts "days due".
+ */
+export interface PauseWindow {
+  id: Id;
+  ownerId: Id;
+  from: LocalDate;
+  to: LocalDate;
+  reason?: string;
+  createdAt: IsoDateTime;
+}
+
+export interface CreatePauseWindowBody {
+  from: LocalDate;
+  to: LocalDate;
+  reason?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Assistant — free-text Q&A and requests over Telegram
+// ---------------------------------------------------------------------------
+
+export interface AssistantAskBody {
+  message: string;
+}
+
+export interface AssistantAskResponse {
+  reply: string;
+}
 
 // ---------------------------------------------------------------------------
 // Telegram linking

@@ -1,11 +1,13 @@
 import { randomInt } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
-import { LinkCodeModel } from '../models/LinkCode.js';
-import { UserModel } from '../models/User.js';
+import { eq } from 'drizzle-orm';
+import { db } from '../db/client.js';
+import { linkCodes, users } from '../db/schema.js';
+import { PG_UNIQUE_VIOLATION, pgErrorCode } from '../db/errors.js';
 import { env } from '../lib/env.js';
 import { toUser } from '../lib/serialize.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, secretMatches } from '../middleware/auth.js';
 
 export const telegramRouter = Router();
 
@@ -34,11 +36,11 @@ telegramRouter.post('/link-code', requireAuth, async (req, res) => {
   // One live code per user: a new request invalidates the previous one, so a
   // code glimpsed over someone's shoulder stops working the moment you
   // generate another.
-  await LinkCodeModel.deleteMany({ userId: req.userId });
+  await db.delete(linkCodes).where(eq(linkCodes.userId, req.userId!));
 
   const code = generateCode();
   const expiresAt = new Date(Date.now() + env.linkCodeTtlSeconds * 1000);
-  await LinkCodeModel.create({ code, userId: req.userId, expiresAt });
+  await db.insert(linkCodes).values({ code, userId: req.userId!, expiresAt });
 
   res.status(201).json({
     code,
@@ -62,7 +64,8 @@ const linkSchema = z.object({
  * there is nothing to resolve yet. So it checks the bot secret directly.
  */
 telegramRouter.post('/link', async (req, res) => {
-  if (req.headers['x-bot-secret'] !== env.botServiceSecret) {
+  const botSecret = req.headers['x-bot-secret'];
+  if (typeof botSecret !== 'string' || !secretMatches(botSecret, env.botServiceSecret)) {
     res.status(401).json({ error: 'Invalid credentials' });
     return;
   }
@@ -74,48 +77,70 @@ telegramRouter.post('/link', async (req, res) => {
   }
   const { code, chatId } = parsed.data;
 
-  const record = await LinkCodeModel.findOne({ code: code.toUpperCase() });
+  const [record] = await db
+    .select()
+    .from(linkCodes)
+    .where(eq(linkCodes.code, code.toUpperCase()));
 
-  // Checked explicitly rather than trusting the TTL index to have removed it:
-  // Mongo's TTL sweeper only runs about once a minute, so an expired document
-  // can still be sitting there. The index is housekeeping, not enforcement.
+  // Expiry is checked here, on every read. Expired rows are only deleted
+  // periodically by the worker's sweep, so "the row exists" never means "the
+  // code is valid".
   if (!record || record.expiresAt.getTime() < Date.now()) {
     res.status(404).json({ error: 'That code is invalid or has expired' });
     return;
   }
 
-  // A chat id can only ever belong to one account. Without this, two people
-  // sharing a Telegram account — or one person re-linking after switching
-  // accounts — would hit the unique index as a raw 500 instead of a message.
-  const existing = await UserModel.findOne({ telegramChatId: chatId });
-  if (existing && existing._id.toString() !== record.userId.toString()) {
+  // A chat id can only ever belong to one account. Checked up front for a
+  // clear message; the UNIQUE constraint on telegram_chat_id is what actually
+  // guarantees it, even if two requests race past this check.
+  const [existing] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.telegramChatId, chatId));
+  if (existing && existing.id !== record.userId) {
     res.status(409).json({ error: 'This Telegram account is already linked elsewhere' });
     return;
   }
 
-  const user = await UserModel.findByIdAndUpdate(
-    record.userId,
-    { telegramChatId: chatId },
-    { new: true },
-  );
+  let user;
+  try {
+    // A TRANSACTION: both statements take effect, or neither does. Without
+    // it, a crash between them could link the account but leave the code
+    // usable, or burn the code without linking anything.
+    user = await db.transaction(async (tx) => {
+      const [linked] = await tx
+        .update(users)
+        .set({ telegramChatId: chatId, updatedAt: new Date() })
+        .where(eq(users.id, record.userId))
+        .returning();
+      // Single-use: burn it in the same transaction as the link.
+      await tx.delete(linkCodes).where(eq(linkCodes.id, record.id));
+      return linked;
+    });
+  } catch (err) {
+    if (pgErrorCode(err) === PG_UNIQUE_VIOLATION) {
+      res.status(409).json({ error: 'This Telegram account is already linked elsewhere' });
+      return;
+    }
+    throw err;
+  }
   if (!user) {
     res.status(404).json({ error: 'User not found' });
     return;
   }
-
-  // Single-use: burn it immediately on success.
-  await LinkCodeModel.deleteOne({ _id: record._id });
 
   res.json(toUser(user));
 });
 
 /** Dashboard-only. Disconnects Telegram without touching anything else. */
 telegramRouter.post('/unlink', requireAuth, async (req, res) => {
-  const user = await UserModel.findByIdAndUpdate(
-    req.userId,
-    { $unset: { telegramChatId: '' } },
-    { new: true },
-  );
+  // Setting the column to NULL is "not linked". Mongo needed $unset to
+  // remove the field; in SQL every row has every column, so it's emptied.
+  const [user] = await db
+    .update(users)
+    .set({ telegramChatId: null, updatedAt: new Date() })
+    .where(eq(users.id, req.userId!))
+    .returning();
   if (!user) {
     res.status(404).json({ error: 'User not found' });
     return;

@@ -1,5 +1,5 @@
-import mongoose from 'mongoose';
 import { Worker, type Job } from 'bullmq';
+import { and, asc, eq, gte, lt, lte } from 'drizzle-orm';
 import { formatTimeOfDay, localDateInZone, localTimeInZone } from '@coach/shared';
 import { env } from './lib/env.js';
 import { createWorkerConnection, queueConnection } from './queue/connection.js';
@@ -16,9 +16,16 @@ import {
   type ReminderJobData,
   type FollowupJobData,
 } from './queue/reminders.js';
-import { GoalModel } from './models/Goal.js';
-import { UserModel } from './models/User.js';
-import { CheckInModel } from './models/CheckIn.js';
+import { db, pool } from './db/client.js';
+import {
+  checkIns,
+  goals,
+  linkCodes,
+  pauseWindows,
+  pendingActions,
+  users,
+} from './db/schema.js';
+import { isUuid } from './lib/validators.js';
 import { generateReminderMessage, type CheckInHistoryEntry } from './lib/ai.js';
 import {
   checkInButtons,
@@ -29,13 +36,13 @@ import {
 /**
  * THE WORKER — a separate process from the API server.
  *
- * Same package (it needs the same models, env, and Mongo connection), different
+ * Same package (it needs the same schema, env, and database), different
  * entry point, different process. The API server answers HTTP requests; this
  * blocks on Redis, waiting for jobs to come due. Splitting them means a burst
  * of reminders can never slow down the dashboard, and either can restart
  * without taking the other down.
  *
- * Every handler below follows ONE rule: TRUST MONGO, NOT THE JOB. A job is just
+ * Every handler below follows ONE rule: TRUST THE DATABASE, NOT THE JOB. A job is just
  * an alarm clock saying "wake up and check". The first thing each handler does
  * is re-read the current truth, because the job may be stale — the goal could
  * have been deleted, archived, edited, or already completed since it was
@@ -74,12 +81,39 @@ async function recentHistoryFor(goalId: string, timezone: string): Promise<Check
   weekAgo.setDate(weekAgo.getDate() - 7);
   const from = localDateInZone(timezone, weekAgo);
 
-  const checkIns = await CheckInModel.find({ goalId, date: { $gte: from, $lte: today } })
-    .select('date status')
-    .sort({ date: 1 })
-    .lean();
+  // SELECT date, status FROM check_ins
+  // WHERE goal_id = $1 AND date >= $2 AND date <= $3 ORDER BY date ASC
+  return db
+    .select({ date: checkIns.date, status: checkIns.status })
+    .from(checkIns)
+    .where(and(eq(checkIns.goalId, goalId), gte(checkIns.date, from), lte(checkIns.date, today)))
+    .orderBy(asc(checkIns.date));
+}
 
-  return checkIns.map((c) => ({ date: c.date, status: c.status }));
+/** Does this goal already have a check-in for this day? */
+async function hasCheckIn(goalId: string, date: string): Promise<boolean> {
+  // Fetch at most one id: we only care WHETHER a row exists, not what's in it.
+  const rows = await db
+    .select({ id: checkIns.id })
+    .from(checkIns)
+    .where(and(eq(checkIns.goalId, goalId), eq(checkIns.date, date)))
+    .limit(1);
+  return rows.length > 0;
+}
+
+async function findGoal(goalId: string) {
+  // Jobs already sitting in Redis can outlive a data-format change (these
+  // held Mongo ObjectIds before the move to Postgres). A malformed id would
+  // make Postgres throw and the job retry pointlessly; "not found" is the
+  // honest answer, and the handlers turn it into a logged skip.
+  if (!isUuid(goalId)) return undefined;
+  const [goal] = await db.select().from(goals).where(eq(goals.id, goalId));
+  return goal;
+}
+
+async function findUser(userId: string) {
+  const [user] = await db.select().from(users).where(eq(users.id, userId));
+  return user;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,18 +123,18 @@ async function recentHistoryFor(goalId: string, timezone: string): Promise<Check
 async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
   const { goalId, scheduleKey } = job.data;
 
-  const goal = await GoalModel.findById(goalId);
+  const goal = await findGoal(goalId);
   if (!goal || goal.status !== 'active') return 'skip: goal deleted or archived';
 
-  const user = await UserModel.findById(goal.ownerId);
+  const user = await findUser(goal.ownerId);
   if (!user) return 'skip: owner no longer exists';
 
   // The staleness check from the dual-write discussion. Recompute the
-  // fingerprint from what Mongo says NOW and compare it exactly to what was
+  // fingerprint from what the database says NOW and compare it exactly to what was
   // stamped into the job when it was scheduled. A mismatch means this alarm
   // was set for an old version of the goal: say nothing, and let the
   // reconciliation sweep re-point the schedule.
-  const currentKey = scheduleKeyFor(cronPatternFor(goal.cadence), user.timezone);
+  const currentKey = scheduleKeyFor(cronPatternFor(goal), user.timezone);
   if (currentKey !== scheduleKey) {
     return `skip: stale schedule (job had ${scheduleKey}, goal is now ${currentKey})`;
   }
@@ -113,9 +147,9 @@ async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
   // Sending "⏰ jogging — 8:00 AM" at 2 PM is worse than not sending at all,
   // so treat significantly-late as its own reason to stay silent.
   const nowInZone = localTimeInZone(user.timezone);
-  const lateness = minutesLate(goal.cadence.timeOfDay, nowInZone);
+  const lateness = minutesLate(goal.timeOfDay, nowInZone);
   if (lateness > LATE_THRESHOLD_MINUTES) {
-    return `skip: too late (scheduled ${goal.cadence.timeOfDay}, now ${nowInZone} in ${user.timezone})`;
+    return `skip: too late (scheduled ${goal.timeOfDay}, now ${nowInZone} in ${user.timezone})`;
   }
 
   if (!user.telegramChatId) return 'skip: telegram not linked';
@@ -123,7 +157,30 @@ async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
   // "Today" in the USER'S timezone — never the server's.
   const date = localDateInZone(user.timezone);
 
-  if (await CheckInModel.exists({ goalId: goal._id, date })) {
+  // Vacation / do-not-disturb. Note what does NOT happen here: no CheckIn row
+  // gets written for a paused day. Marking it "skipped" would break streaks
+  // AND make the (future) negotiation loop's pattern detection try to
+  // renegotiate a goal that's fine — the user was just away. A paused day is
+  // simply excluded from whatever later counts "days due", by never having
+  // existed in the first place.
+  //
+  // SELECT to_date FROM pause_windows
+  // WHERE owner_id = $1 AND from_date <= $2 AND to_date >= $2 LIMIT 1
+  // i.e. "is today inside any of this user's pause windows?"
+  const [pause] = await db
+    .select({ to: pauseWindows.to })
+    .from(pauseWindows)
+    .where(
+      and(
+        eq(pauseWindows.ownerId, user.id),
+        lte(pauseWindows.from, date),
+        gte(pauseWindows.to, date),
+      ),
+    )
+    .limit(1);
+  if (pause) return `skip: paused until ${pause.to}`;
+
+  if (await hasCheckIn(goal.id, date)) {
     return 'skip: already checked in today';
   }
 
@@ -143,7 +200,7 @@ async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
   });
 
   // The header (title, time) is ALWAYS this exact deterministic line, straight
-  // from Mongo — never AI-generated. Only the second line is ever allowed to
+  // from the database — never AI-generated. Only the second line is ever allowed to
   // come from the model, and a failure there degrades to the same static
   // text this feature shipped with, never to a broken or missing reminder.
   const aiLine = await generateReminderMessage({
@@ -155,7 +212,7 @@ async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
 
   await sendTelegramMessage(
     user.telegramChatId,
-    `⏰ ${goal.title} — ${formatTimeOfDay(goal.cadence.timeOfDay)}\n\n${aiLine ?? "Tap when you've done it."}`,
+    `⏰ ${goal.title} — ${formatTimeOfDay(goal.timeOfDay)}\n\n${aiLine ?? "Tap when you've done it."}`,
     checkInButtons(goalId, date),
   );
 
@@ -169,18 +226,18 @@ async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
 async function handleFollowup(job: Job<FollowupJobData>): Promise<string> {
   const { goalId, date } = job.data;
 
-  const goal = await GoalModel.findById(goalId);
+  const goal = await findGoal(goalId);
   if (!goal || goal.status !== 'active') return 'skip: goal deleted or archived';
 
   // The whole point of a follow-up: only speak if the reminder went unanswered.
   // If they tapped Done (in Telegram or on the dashboard) in the meantime,
   // stay quiet — a follow-up after you've already done the thing is noise,
   // and noise is how people end up muting the bot.
-  if (await CheckInModel.exists({ goalId: goal._id, date })) {
+  if (await hasCheckIn(goal.id, date)) {
     return 'skip: checked in since the reminder';
   }
 
-  const user = await UserModel.findById(goal.ownerId);
+  const user = await findUser(goal.ownerId);
   if (!user?.telegramChatId) return 'skip: telegram not linked';
 
   await sendTelegramMessage(
@@ -197,23 +254,28 @@ async function handleFollowup(job: Job<FollowupJobData>): Promise<string> {
 // ---------------------------------------------------------------------------
 
 /**
- * Makes Redis match Mongo, in both directions:
+ * Makes Redis match Postgres, in both directions:
  *   1. every active goal gets its schedule re-upserted (fixes MISSING or STALE)
  *   2. every goal-scheduler with no matching active goal is removed (fixes ORPHANS)
  *
- * This is what repairs the crash window: if the API updated a goal in Mongo and
- * died before touching Redis, the damage lasts at most one sweep interval. And
- * it's only safe to do this blindly because syncGoalSchedule is idempotent.
+ * This is what repairs the crash window: if the API updated a goal in Postgres
+ * and died before touching Redis, the damage lasts at most one sweep interval.
+ * And it's only safe to do this blindly because syncGoalSchedule is idempotent.
+ *
+ * It also deletes expired link codes and assistant drafts. Postgres has no TTL
+ * indexes (Mongo deleted these on its own), so this sweep is their garbage
+ * collector. Correctness never depends on it: every read of those rows checks
+ * expires_at itself. This only stops dead rows from piling up.
  *
  * At larger scale you'd stop re-syncing everything and track a version number
  * per goal to re-sync only what changed. At this scale, "just do all of them"
  * is simpler and obviously correct.
  */
 async function handleReconcile(): Promise<string> {
-  const goals = await GoalModel.find({ status: 'active' });
-  for (const goal of goals) await syncGoalSchedule(goal);
+  const activeGoals = await db.select().from(goals).where(eq(goals.status, 'active'));
+  for (const goal of activeGoals) await syncGoalSchedule(goal);
 
-  const expected = new Set(goals.map((g) => schedulerIdFor(g._id.toString())));
+  const expected = new Set(activeGoals.map((g) => schedulerIdFor(g.id)));
   const schedulers = await reminderQueue.getJobSchedulers();
 
   let removed = 0;
@@ -224,7 +286,22 @@ async function handleReconcile(): Promise<string> {
     }
   }
 
-  return `synced ${goals.length} goal(s), removed ${removed} orphaned scheduler(s)`;
+  // DELETE FROM link_codes WHERE expires_at < now() RETURNING id
+  // (RETURNING only so we can count what was removed.)
+  const now = new Date();
+  const expiredCodes = await db
+    .delete(linkCodes)
+    .where(lt(linkCodes.expiresAt, now))
+    .returning({ id: linkCodes.id });
+  const expiredDrafts = await db
+    .delete(pendingActions)
+    .where(lt(pendingActions.expiresAt, now))
+    .returning({ id: pendingActions.id });
+
+  return (
+    `synced ${activeGoals.length} goal(s), removed ${removed} orphaned scheduler(s), ` +
+    `swept ${expiredCodes.length} expired code(s) and ${expiredDrafts.length} expired draft(s)`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -234,8 +311,11 @@ async function main() {
     throw new Error('TELEGRAM_BOT_TOKEN is required to run the worker');
   }
 
-  await mongoose.connect(env.mongoUri);
-  console.log('[worker] mongo connected');
+  // The pool connects lazily, on the first query. Running one now means a
+  // wrong DATABASE_URL or a stopped container fails loudly at startup instead
+  // of on the first reminder, possibly hours later.
+  await pool.query('SELECT 1');
+  console.log('[worker] postgres connected');
 
   // Wait for Redis to actually be connected before issuing any commands.
   //
@@ -314,7 +394,8 @@ async function main() {
     // already have ended one, and quitting a closed client throws.
     await workerConnection.quit().catch(() => {});
     await queueConnection.quit().catch(() => {});
-    await mongoose.disconnect();
+    // Closes every pooled connection, after any in-flight queries finish.
+    await pool.end();
     process.exit(0);
   };
   process.once('SIGINT', shutdown);
