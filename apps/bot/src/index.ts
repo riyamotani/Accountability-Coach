@@ -16,6 +16,28 @@ const bot = new Telegraf(env.botToken);
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
 /**
+ * Picks one of several wordings at random.
+ *
+ * Only used for the messages someone sees EVERY day — an identical
+ * "Marked done." after every single check-in is what makes a bot feel like a
+ * machine. Rare messages stay fixed: variety there just costs predictability.
+ */
+function pick(options: readonly string[]): string {
+  return options[Math.floor(Math.random() * options.length)] ?? options[0]!;
+}
+
+const DONE_REPLIES = [
+  '✅ Done! Nice one.',
+  "✅ Logged. That's how streaks get built.",
+  '✅ Done. Future you says thanks.',
+] as const;
+
+const SKIPPED_REPLIES = [
+  "⏭️ Skipped. No stress — there's always the next one.",
+  '⏭️ Logged as skipped. Tomorrow is a fresh go.',
+] as const;
+
+/**
  * Today's date as "YYYY-MM-DD".
  *
  * KNOWN LIMITATION: this uses the BOT SERVER's local date, not the user's
@@ -53,10 +75,10 @@ bot.start(async (ctx) => {
 
   if (!payload) {
     await ctx.reply(
-      'Hi! I’m your accountability coach.\n\n' +
-        'To connect your account, open the dashboard → Settings → Connect Telegram, ' +
-        'then send me the code you get there.\n\n' +
-        'Once connected: /goals to see today, /done to check something off.',
+      'Hey! I’m your accountability coach. 👋\n\n' +
+        'Let’s get you connected: open the dashboard → Settings → Connect Telegram, ' +
+        'then send me the code it gives you.\n\n' +
+        'After that: /goals shows your day, /done checks something off.',
     );
     return;
   }
@@ -64,25 +86,26 @@ bot.start(async (ctx) => {
   try {
     const user = (await api.link(payload, chatId)) as User;
     await ctx.reply(
-      `Connected — hi ${user.displayName}. 👋\n\n` +
-        'Try /goals to see what’s due today.',
+      `You’re all set, ${user.displayName}! 🎉\n\n` +
+        'I’ll nudge you when a goal is due. Try /goals to see what’s on today.',
     );
   } catch (err) {
     await ctx.reply(
       err instanceof ApiRequestError
-        ? `Couldn’t connect: ${err.message}`
-        : 'Something went wrong connecting your account.',
+        ? `Hmm, that didn’t work: ${err.message}`
+        : 'Something went wrong connecting your account. Mind trying again?',
     );
   }
 });
 
 bot.help(async (ctx) => {
   await ctx.reply(
-    'What I can do:\n\n' +
+    'Here’s what I can do:\n\n' +
       '/goals — what’s due today and how you’re doing\n' +
       '/done — mark a goal complete\n' +
       '/skip — mark a goal skipped\n' +
-      '/start — connect your account',
+      '/start — connect your account\n\n' +
+      'You can also just talk to me — tell me how it went, or ask how your week looks.',
   );
 });
 
@@ -107,7 +130,7 @@ bot.command('goals', async (ctx) => {
     );
 
     if (due.length === 0) {
-      await ctx.reply(`Nothing due today (${DAY_NAMES[todayDow]}). Enjoy it.`);
+      await ctx.reply(`Nothing due today (${DAY_NAMES[todayDow]}). Enjoy the breather.`);
       return;
     }
 
@@ -118,9 +141,13 @@ bot.command('goals', async (ctx) => {
     });
 
     const doneCount = due.filter((g) => byGoal.get(g.id) === 'done').length;
-    await ctx.reply(`*Today* — ${doneCount}/${due.length} done\n\n${lines.join('\n')}`, {
-      parse_mode: 'Markdown',
-    });
+
+    // PLAIN TEXT, deliberately. With parse_mode 'Markdown', Telegram also
+    // interprets `_` and `*` inside GOAL TITLES — so a goal called
+    // "read_books" or "5*3 pushups" makes the formatting invalid and Telegram
+    // rejects the whole message, breaking /goals entirely. Bold isn't worth
+    // making user-supplied text part of the markup.
+    await ctx.reply(`Today — ${doneCount}/${due.length} done\n\n${lines.join('\n')}`);
   } catch (err) {
     await replyForError(ctx, err);
   }
@@ -153,12 +180,12 @@ function makeCheckInCommand(status: CheckInStatus) {
       );
 
       if (due.length === 0) {
-        await ctx.reply('Nothing due today to mark.');
+        await ctx.reply('Nothing due today to mark. Enjoy the day off.');
         return;
       }
 
       await ctx.reply(
-        status === 'done' ? 'Which one did you do?' : 'Which one are you skipping?',
+        status === 'done' ? 'Nice — which one?' : 'No worries — which one are you skipping?',
         Markup.inlineKeyboard(
           due.map((g) => [Markup.button.callback(g.title, `coach:${status}:${g.id}`)]),
         ),
@@ -202,10 +229,10 @@ bot.action(CHECK_IN_BUTTON, async (ctx) => {
 
     // Acknowledge the button press — without this Telegram shows a spinner on
     // the button until it times out.
-    await ctx.answerCbQuery(status === 'done' ? 'Nice.' : 'Logged.');
+    await ctx.answerCbQuery(status === 'done' ? 'Nice!' : 'Logged.');
     // Replace the keyboard with a confirmation so the buttons can't be
     // pressed twice and the chat doesn't fill with dead menus.
-    await ctx.editMessageText(status === 'done' ? '✅ Marked done.' : '⏭️ Marked skipped.');
+    await ctx.editMessageText(pick(status === 'done' ? DONE_REPLIES : SKIPPED_REPLIES));
   } catch (err) {
     console.error('[bot] check-in button failed:', err);
     // Best-effort only. If the FIRST answerCbQuery above failed because the
@@ -214,7 +241,7 @@ bot.action(CHECK_IN_BUTTON, async (ctx) => {
     // the exact same reason. Without `.catch(() => {})` here, that second
     // failure goes uncaught and crashes the whole bot process — for every
     // user, over one stale tap from one person.
-    await ctx.answerCbQuery('Something went wrong').catch(() => {});
+    await ctx.answerCbQuery('Something went wrong on my end').catch(() => {});
     await replyForError(ctx, err).catch(() => {});
   }
 });
@@ -224,13 +251,21 @@ bot.action(CHECK_IN_BUTTON, async (ctx) => {
 async function replyForError(ctx: { reply: (text: string) => Promise<unknown> }, err: unknown) {
   if (err instanceof NotLinkedError) {
     await ctx.reply(
-      'Your Telegram isn’t connected to an account yet.\n\n' +
+      'We’re not connected yet!\n\n' +
         'Open the dashboard → Settings → Connect Telegram, then send me the code.',
     );
     return;
   }
+  // 429 means "wait", and the API already phrased it for the user ("give me
+  // about 30s"). Replacing that with a generic apology would hide the one
+  // piece of information that helps: how long to wait.
+  if (err instanceof ApiRequestError && err.status === 429) {
+    await ctx.reply(err.message);
+    return;
+  }
+
   console.error('[bot] error:', err);
-  await ctx.reply('Something went wrong. Try again in a moment.');
+  await ctx.reply('Oops, something went wrong on my end. Mind trying again in a moment?');
 }
 
 /**

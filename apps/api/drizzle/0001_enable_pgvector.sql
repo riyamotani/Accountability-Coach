@@ -1,0 +1,15 @@
+-- Enable pgvector in this database.
+--
+-- The extension ships with the Docker image (and is available on Neon), but
+-- being installed on the server is not the same as being enabled in a
+-- database: that takes this statement, once per database. Until it runs,
+-- `vector(1536)` is not a type Postgres recognises, so the memories table in
+-- the next migration cannot be created.
+--
+-- Written by hand because drizzle-kit generates SQL by diffing the TypeScript
+-- schema, which describes tables and columns only — it has no way to express
+-- "this database also needs an extension".
+--
+-- IF NOT EXISTS keeps it safe to run against a database where it is already
+-- enabled, which matters for the next environment (Neon) as much as this one.
+CREATE EXTENSION IF NOT EXISTS vector;

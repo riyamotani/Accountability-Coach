@@ -3,6 +3,7 @@ import { eq } from 'drizzle-orm';
 import { queueConnection } from './connection.js';
 import { env } from '../lib/env.js';
 import { db } from '../db/client.js';
+import { describeError } from '../db/errors.js';
 import { goals, users, type GoalRow } from '../db/schema.js';
 
 export const QUEUE_NAME = 'reminders';
@@ -194,7 +195,9 @@ export async function syncGoalSchedule(goal: GoalRow): Promise<void> {
   } catch (err) {
     console.error(
       `[scheduler] sync failed for goal ${goalId} — reconciliation will retry:`,
-      err instanceof Error ? err.message : err,
+      // This block also reads the database, and a failed query's message
+      // carries its parameters. describeError strips them.
+      describeError(err),
     );
   }
 }
@@ -206,7 +209,7 @@ export async function removeGoalSchedule(goalId: string): Promise<void> {
   } catch (err) {
     console.error(
       `[scheduler] remove failed for goal ${goalId} — reconciliation will retry:`,
-      err instanceof Error ? err.message : err,
+      describeError(err),
     );
   }
 }

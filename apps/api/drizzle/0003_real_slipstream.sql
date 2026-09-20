@@ -1,0 +1,3 @@
+ALTER TABLE "pending_actions" ALTER COLUMN "kind" SET DATA TYPE text;--> statement-breakpoint
+ALTER TABLE "pending_actions" ADD CONSTRAINT "pending_actions_kind_valid" CHECK ("kind" IN ('pauseWindow', 'checkIn', 'goalCreate', 'goalUpdate', 'goalArchive', 'goalDelete', 'scheduleBlockCreate', 'scheduleBlockUpdate', 'scheduleBlockDelete'));--> statement-breakpoint
+DROP TYPE "public"."pending_action_kind";

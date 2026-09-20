@@ -285,6 +285,36 @@ export function localTimeInZone(timeZone: string, at: Date = new Date()): string
  * Storage stays 24-hour ("HH:mm") because it sorts and compares correctly as
  * a plain string; only the DISPLAY is 12-hour. Never store the formatted form.
  */
+const WEEKDAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTH_NAMES = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+/**
+ * "2026-09-20" -> "Sun 20 Sep". Returns null if the date isn't a real one.
+ *
+ * Same reasoning as formatTimeOfDay: one spelling of a date for every client.
+ * Built from fixed names rather than toLocaleDateString, whose output varies
+ * with the runtime's locale data (some versions write "Sept").
+ *
+ * Read in UTC on purpose: a LocalDate is a calendar day, not an instant, so
+ * no timezone may shift it to the day before or after.
+ */
+export function formatLocalDate(localDate: LocalDate): string | null {
+  const d = new Date(`${localDate}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return null;
+  return `${WEEKDAY_NAMES[d.getUTCDay()]} ${d.getUTCDate()} ${MONTH_NAMES[d.getUTCMonth()]}`;
+}
+
+/** Days from `from` to `to`, both LocalDates. Negative if `to` is earlier. */
+export function daysBetween(from: LocalDate, to: LocalDate): number {
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  const a = new Date(`${from}T00:00:00Z`).getTime();
+  const b = new Date(`${to}T00:00:00Z`).getTime();
+  return Math.round((b - a) / MS_PER_DAY);
+}
+
 export function formatTimeOfDay(hhmm: string): string {
   const [h, m] = hhmm.split(':').map(Number);
   const hour = h ?? 0;

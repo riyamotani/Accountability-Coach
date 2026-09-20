@@ -1,5 +1,5 @@
 import { Worker, type Job } from 'bullmq';
-import { and, asc, eq, gte, lt, lte } from 'drizzle-orm';
+import { and, asc, eq, gte, isNull, lt, lte } from 'drizzle-orm';
 import { formatTimeOfDay, localDateInZone, localTimeInZone } from '@coach/shared';
 import { env } from './lib/env.js';
 import { createWorkerConnection, queueConnection } from './queue/connection.js';
@@ -18,13 +18,24 @@ import {
 } from './queue/reminders.js';
 import { db, pool } from './db/client.js';
 import {
+  chatMessages,
   checkIns,
   goals,
   linkCodes,
+  memories,
   pauseWindows,
   pendingActions,
   users,
 } from './db/schema.js';
+import {
+  EMBED_MEMORY_JOB,
+  SYNC_MEMORY_JOB,
+  enqueueMemoryEmbedding,
+  type EmbedMemoryJobData,
+  type SyncMemoryJobData,
+} from './queue/memories.js';
+import { getSyncTarget } from './lib/memory/index.js';
+import { currentEmbeddingModel, embedText } from './lib/embeddings.js';
 import { isUuid } from './lib/validators.js';
 import { generateReminderMessage, type CheckInHistoryEntry } from './lib/ai.js';
 import {
@@ -54,6 +65,34 @@ import {
  */
 
 const RECONCILE_EVERY_MS = 5 * 60 * 1000;
+
+/** Per sweep, so a large backlog is worked through over several sweeps. */
+const UNEMBEDDED_SWEEP_LIMIT = 50;
+
+/** How long raw chat turns are kept. Facts worth keeping become memories. */
+const CHAT_HISTORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Wordings for the messages a user sees EVERY day. The exact same sentence
+ * every morning is what makes a bot feel automated; one of a few is enough to
+ * avoid that. Rare messages stay fixed.
+ */
+function pick<T>(options: readonly T[]): T {
+  return options[Math.floor(Math.random() * options.length)] ?? options[0]!;
+}
+
+/** Used when the AI line is unavailable — the reminder still has to read well. */
+const REMINDER_FALLBACKS = [
+  "You've got this. Tap below when it's done.",
+  'Time to make it happen — tap below when done.',
+  'Small step, big streak. Tap below when done.',
+] as const;
+
+const FOLLOWUP_OPENERS = [
+  (title: string) => `👋 Hey, did ${title} happen today?`,
+  (title: string) => `👋 Quick check — how'd ${title} go?`,
+  (title: string) => `👋 Just checking in on ${title}. Get to it?`,
+] as const;
 
 // How many minutes late a reminder is allowed to be before we treat it as an
 // overdue catch-up rather than a genuine, on-time fire, and stay silent.
@@ -212,7 +251,7 @@ async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
 
   await sendTelegramMessage(
     user.telegramChatId,
-    `⏰ ${goal.title} — ${formatTimeOfDay(goal.timeOfDay)}\n\n${aiLine ?? "Tap when you've done it."}`,
+    `⏰ ${goal.title} — ${formatTimeOfDay(goal.timeOfDay)}\n\n${aiLine ?? pick(REMINDER_FALLBACKS)}`,
     checkInButtons(goalId, date),
   );
 
@@ -242,11 +281,82 @@ async function handleFollowup(job: Job<FollowupJobData>): Promise<string> {
 
   await sendTelegramMessage(
     user.telegramChatId,
-    `👋 Checking in — did you get to ${goal.title} today?`,
+    pick(FOLLOWUP_OPENERS)(goal.title),
     checkInButtons(goalId, date),
   );
 
   return 'sent';
+}
+
+// ---------------------------------------------------------------------------
+// embed-memory — turn a stored memory into a searchable vector
+// ---------------------------------------------------------------------------
+
+/**
+ * The second half of "write the words first, embed them after". The memory
+ * row already exists; this fills in the vector that makes it findable.
+ *
+ * Throws on failure so BullMQ retries: an embedding API that is briefly down
+ * should delay search, never lose a memory.
+ */
+async function handleEmbedMemory(job: Job<EmbedMemoryJobData>): Promise<string> {
+  const { memoryId } = job.data;
+
+  const [memory] = await db
+    .select({
+      id: memories.id,
+      content: memories.content,
+      embedding: memories.embedding,
+      embeddingModel: memories.embeddingModel,
+    })
+    .from(memories)
+    .where(eq(memories.id, memoryId));
+  if (!memory) return 'skip: memory deleted';
+
+  // Already done. Re-running a job must not pay for the same embedding twice.
+  if (memory.embedding && memory.embeddingModel === currentEmbeddingModel()) {
+    return 'skip: already embedded';
+  }
+
+  const embedding = await embedText(memory.content);
+
+  await db
+    .update(memories)
+    .set({ embedding, embeddingModel: currentEmbeddingModel(), updatedAt: new Date() })
+    .where(eq(memories.id, memoryId));
+
+  return `embedded (${embedding.length} dims)`;
+}
+
+// ---------------------------------------------------------------------------
+// sync-memory — copy a saved memory to the hosted provider
+// ---------------------------------------------------------------------------
+
+/**
+ * Pushes one memory to whichever provider is active (Mem0 today).
+ *
+ * Our own row is already written; this keeps the provider's searchable copy
+ * in step with it. Throws on failure so BullMQ retries — a provider being
+ * briefly unreachable should delay the copy, never skip it.
+ */
+async function handleSyncMemory(job: Job<SyncMemoryJobData>): Promise<string> {
+  const target = getSyncTarget();
+  if (!target) return 'skip: no hosted provider configured';
+
+  const { memoryId } = job.data;
+  const [memory] = await db
+    .select({ ownerId: memories.ownerId, content: memories.content, source: memories.source })
+    .from(memories)
+    .where(eq(memories.id, memoryId));
+  if (!memory) return 'skip: memory deleted';
+
+  await target.store.add({
+    userId: memory.ownerId,
+    content: memory.content,
+    source: memory.source,
+  });
+
+  return `synced to ${target.name}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,9 +408,32 @@ async function handleReconcile(): Promise<string> {
     .where(lt(pendingActions.expiresAt, now))
     .returning({ id: pendingActions.id });
 
+  // Old chat turns. Unlike memories — which are kept forever on purpose —
+  // the raw conversation is working state: it exists to resolve "it" and
+  // "that one" within a conversation, and a month-old exchange can no longer
+  // do that for anyone. Anything worth keeping from it was saved as a memory.
+  const oldTurns = await db
+    .delete(chatMessages)
+    .where(lt(chatMessages.createdAt, new Date(now.getTime() - CHAT_HISTORY_RETENTION_MS)))
+    .returning({ id: chatMessages.id });
+
+  // Memories whose embedding job never ran or never succeeded (Redis was
+  // down when they were saved, the worker died mid-job, the AI was out of
+  // credit). Re-queued rather than embedded inline, so one sweep can't turn
+  // into a long batch of API calls — and the deterministic job id makes
+  // re-queuing something already in flight a no-op.
+  const unembedded = await db
+    .select({ id: memories.id })
+    .from(memories)
+    .where(isNull(memories.embedding))
+    .limit(UNEMBEDDED_SWEEP_LIMIT);
+  for (const memory of unembedded) await enqueueMemoryEmbedding(memory.id);
+
   return (
     `synced ${activeGoals.length} goal(s), removed ${removed} orphaned scheduler(s), ` +
-    `swept ${expiredCodes.length} expired code(s) and ${expiredDrafts.length} expired draft(s)`
+    `swept ${expiredCodes.length} expired code(s), ${expiredDrafts.length} expired draft(s) ` +
+    `and ${oldTurns.length} old chat turn(s), ` +
+    `re-queued ${unembedded.length} unembedded memor(ies)`
   );
 }
 
@@ -349,6 +482,10 @@ async function main() {
             return await handleFollowup(job as Job<FollowupJobData>);
           case 'reconcile':
             return await handleReconcile();
+          case EMBED_MEMORY_JOB:
+            return await handleEmbedMemory(job as Job<EmbedMemoryJobData>);
+          case SYNC_MEMORY_JOB:
+            return await handleSyncMemory(job as Job<SyncMemoryJobData>);
           default:
             return `skip: unknown job name "${job.name}"`;
         }

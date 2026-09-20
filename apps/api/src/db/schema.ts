@@ -12,6 +12,7 @@ import {
   timestamp,
   unique,
   uuid,
+  vector,
 } from 'drizzle-orm/pg-core';
 
 /**
@@ -59,7 +60,28 @@ const timestamps = () => ({
  */
 export const goalStatus = pgEnum('goal_status', ['active', 'archived']);
 export const checkInStatus = pgEnum('check_in_status', ['done', 'partial', 'skipped']);
-export const pendingActionKind = pgEnum('pending_action_kind', ['pauseWindow', 'checkIn']);
+/**
+ * What kind of change a draft represents.
+ *
+ * `text` + CHECK rather than a Postgres enum, changed once the assistant
+ * gained the ability to create and edit goals: an enum is right for a CLOSED
+ * set (a check-in is done/partial/skipped, and always will be), but every new
+ * thing the bot learns to do adds a kind here. Adding a value to an enum type
+ * needs its own migration; adding one to this list is a CHECK change, and the
+ * list lives next to the code that reads it.
+ */
+export const PENDING_ACTION_KINDS = [
+  'pauseWindow',
+  'checkIn',
+  'goalCreate',
+  'goalUpdate',
+  'goalArchive',
+  'goalDelete',
+  'scheduleBlockCreate',
+  'scheduleBlockUpdate',
+  'scheduleBlockDelete',
+] as const;
+export type PendingActionKind = (typeof PENDING_ACTION_KINDS)[number];
 
 // ---------------------------------------------------------------------------
 // users
@@ -277,14 +299,139 @@ export const pendingActions = pgTable(
       .notNull()
       .unique()
       .references(() => users.id, { onDelete: 'cascade' }),
-    kind: pendingActionKind('kind').notNull(),
+    kind: text('kind').$type<PendingActionKind>().notNull(),
     // jsonb: stored as parsed binary JSON, queryable, shape depends on `kind`.
     // Validated by the tool that writes it, like Mongoose's `Mixed` was.
     payload: jsonb('payload').$type<PendingActionPayload>().notNull(),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('pending_actions_expires_at_idx').on(t.expiresAt)],
+  (t) => [
+    index('pending_actions_expires_at_idx').on(t.expiresAt),
+    // sql.raw, not `${kind}` interpolation: a CHECK is part of the stored
+    // table definition, so the values must be written into it literally.
+    // Interpolation would send them as query PARAMETERS ($1, $2, …), which is
+    // right for a query and invalid in a constraint — Postgres rejects a
+    // definition that references parameters. The values here are our own
+    // constants, never user input.
+    check(
+      'pending_actions_kind_valid',
+      sql.raw(`"kind" IN (${PENDING_ACTION_KINDS.map((kind) => `'${kind}'`).join(', ')})`),
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// chat_messages — the running conversation with the assistant
+// ---------------------------------------------------------------------------
+
+/**
+ * SHORT-TERM memory, and a different thing from the `memories` table below.
+ *
+ * Each call to the model is a fresh HTTP request that remembers nothing about
+ * the last one. Without this table, "actually make it 10pm" arrives with no
+ * idea what "it" is, because the goal was created in a request that no longer
+ * exists anywhere. (Seen live: the bot created a goal, then said it didn't
+ * know which goal the user meant, seconds later.)
+ *
+ * The split is worth keeping clear:
+ *   chat_messages — what was SAID recently, in order. Resolves "it", "that
+ *                   one", "make it later". Read by RECENCY.
+ *   memories      — what is TRUE about the user, however long ago they said
+ *                   it. Read by MEANING, via embeddings.
+ *
+ * Semantic search cannot do the first job: "actually make it 10pm" has almost
+ * no meaning in common with "read 20 pages every weekday at 9pm", so it would
+ * score low — while "the turn immediately before this one" is trivially
+ * correct and needs no AI at all.
+ */
+export const chatMessages = pgTable(
+  'chat_messages',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    // Only the two ends of the conversation are stored. Tool calls and their
+    // results are deliberately left out: replaying them later would show the
+    // model an hour-old goal list as if it were current.
+    role: text('role').$type<'user' | 'assistant'>().notNull(),
+    content: text('content').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    // "The last N messages for this user" — the only query this table serves.
+    index('chat_messages_owner_created_idx').on(t.ownerId, t.createdAt.desc()),
+    check('chat_messages_role_valid', sql.raw(`"role" IN ('user', 'assistant')`)),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// memories — the freeform things a user tells the bot
+// ---------------------------------------------------------------------------
+
+/**
+ * Where a memory came from. Not an enum type, because new sources are likely
+ * (a weekly digest, an imported journal) and adding a value to a Postgres
+ * enum needs a migration, while text + CHECK does not.
+ */
+export const MEMORY_SOURCES = ['chat', 'checkIn', 'digest'] as const;
+export type MemorySource = (typeof MEMORY_SOURCES)[number];
+
+/** Must match the embedding model in env.ts. Changing it means re-embedding. */
+export const EMBEDDING_DIMENSIONS = 1536;
+
+export const memories = pgTable(
+  'memories',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    // The user's own words, stored exactly as written and NEVER edited.
+    // This table is the source of truth for recall: summaries and any
+    // external memory provider are rebuilt from it, so it must keep the
+    // history those would otherwise overwrite.
+    content: text('content').notNull(),
+    source: text('source').$type<MemorySource>().notNull(),
+
+    /**
+     * The meaning of `content` as 1536 numbers, from the embedding model.
+     * Nullable on purpose: the row is written first and embedded after (a
+     * retryable job), so a temporary AI outage can't lose what the user said.
+     * A row with NULL here is simply not searchable yet.
+     */
+    embedding: vector('embedding', { dimensions: EMBEDDING_DIMENSIONS }),
+    // Which model produced `embedding`. Vectors from different models aren't
+    // comparable, so a model change has to be detectable rather than silently
+    // corrupting search results.
+    embeddingModel: text('embedding_model'),
+
+    ...timestamps(),
+  },
+  (t) => [
+    // "This user's memories, newest first" — and the owner filter every
+    // similarity search starts from.
+    index('memories_owner_created_idx').on(t.ownerId, t.createdAt.desc()),
+
+    /**
+     * An HNSW index over the vectors: the thing that makes "find the nearest
+     * points" fast instead of comparing against every row. `vector_cosine_ops`
+     * must match the distance function the query uses (cosine distance here);
+     * an index built for one distance can't serve another.
+     *
+     * Unlike a B-tree, this index is APPROXIMATE — it can miss a true nearest
+     * neighbour occasionally, in exchange for being dramatically faster. For
+     * "remind me what they said about this", that trade is fine.
+     */
+    index('memories_embedding_idx').using('hnsw', t.embedding.op('vector_cosine_ops')),
+    check('memories_content_not_empty', sql`length(trim(${t.content})) > 0`),
+    check(
+      'memories_source_valid',
+      sql`${t.source} IN ('chat', 'checkIn', 'digest')`,
+    ),
+  ],
 );
 
 // ---------------------------------------------------------------------------
@@ -301,3 +448,5 @@ export type ScheduleBlockRow = typeof scheduleBlocks.$inferSelect;
 export type PauseWindowRow = typeof pauseWindows.$inferSelect;
 export type LinkCodeRow = typeof linkCodes.$inferSelect;
 export type PendingActionRow = typeof pendingActions.$inferSelect;
+export type MemoryRow = typeof memories.$inferSelect;
+export type ChatMessageRow = typeof chatMessages.$inferSelect;

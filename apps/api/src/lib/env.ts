@@ -76,4 +76,27 @@ export const env = {
   // contain users' goals and check-in history; fast (~0.4s, well inside our
   // 5s timeout); and from an established provider.
   aiModel: process.env.AI_MODEL ?? 'mistral/ministral-14b',
+
+  // Turns a memory into the numbers we search by. Changing this invalidates
+  // every stored vector — they aren't comparable across models — so a change
+  // means a migration of the column's size plus re-embedding everything.
+  // Must produce EMBEDDING_DIMENSIONS values (see db/schema.ts); the code
+  // checks and refuses rather than storing a mismatched vector.
+  //
+  // Cohere embed-v4.0: available on the Gateway's free tier (OpenAI's
+  // embedding models are not), retrieval is Cohere's core product, and its
+  // 1536 dimensions match the column.
+  aiEmbeddingModel: process.env.AI_EMBEDDING_MODEL ?? 'cohere/embed-v4.0',
+
+  // --- Memory layer ---
+
+  // Which store answers memory SEARCHES: 'pgvector' (ours) or 'mem0'.
+  // Writes always go to our own table first whatever this says — the
+  // provider is a derived index, not the record. Switching to a provider
+  // with nothing in it yet needs the backfill script; see scripts/.
+  memoryProvider: process.env.MEMORY_PROVIDER ?? 'pgvector',
+
+  // mem0.ai → Dashboard → API Keys. Optional: without it the app simply
+  // keeps using pgvector, so a missing key degrades instead of breaking.
+  mem0ApiKey: process.env.MEM0_API_KEY ?? '',
 } as const;
