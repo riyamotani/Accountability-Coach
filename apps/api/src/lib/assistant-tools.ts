@@ -15,6 +15,12 @@ import {
 import { isUuid } from './validators.js';
 import { getMemoryStore } from './memory/index.js';
 import { removeGoalSchedule, syncGoalSchedule } from '../queue/reminders.js';
+import {
+  advanceRound,
+  closeNegotiation,
+  findOpenNegotiation,
+  MAX_ROUNDS,
+} from './negotiation/state.js';
 
 /**
  * The tool set for the free-text assistant. Two trust levels, and the split
@@ -199,7 +205,164 @@ function withRepeatGuard(tools: ToolSet): ToolSet {
   );
 }
 
-export function buildAssistantTools(userId: string, timezone: string): ToolSet {
+/**
+ * The user's side of a negotiation the BOT started: accept, counter, or
+ * decline. Built separately so they can be withheld entirely when no
+ * proposal is waiting.
+ */
+function negotiationTools(userId: string): ToolSet {
+  return {
+    acceptNegotiation: tool({
+      description:
+        'The user AGREED to the change the bot proposed for a goal. Call this when they ' +
+        'say yes, sounds good, ok do it, etc. It applies exactly what was proposed — you ' +
+        'cannot change the terms here.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        const open = await findOpenNegotiation(userId);
+        if (!open) return { applied: false, error: 'There is no open proposal to accept.' };
+
+        // Read from the STORED proposal, never from anything the model
+        // passes in. Even a model that misreads "no, not that" as agreement
+        // can only apply the change the user was actually shown.
+        const proposal = open.proposal as {
+          daysOfWeek?: number[];
+          timeOfDay?: string;
+          target?: number;
+        };
+
+        const changes = {
+          ...(proposal.daysOfWeek ? { daysOfWeek: proposal.daysOfWeek } : {}),
+          ...(proposal.timeOfDay ? { timeOfDay: proposal.timeOfDay } : {}),
+          ...(proposal.target !== undefined ? { target: proposal.target } : {}),
+        };
+
+        // People write the number into the title ("Read 20 pages"). Seen
+        // live: a negotiated target of 10 left the title saying 20, so every
+        // reminder contradicted the goal it was reminding about. Swap the old
+        // number only when it appears exactly once as a whole word — anything
+        // more ambiguous is left alone rather than guessed at.
+        const [current] = await db
+          .select({ title: goals.title, target: goals.target })
+          .from(goals)
+          .where(and(eq(goals.id, open.goalId), eq(goals.ownerId, userId)));
+        let title: string | undefined;
+        if (current?.target != null && proposal.target !== undefined) {
+          const oldNumber = new RegExp(`\\b${current.target}\\b`, 'g');
+          if ((current.title.match(oldNumber) ?? []).length === 1) {
+            title = current.title.replace(oldNumber, String(proposal.target));
+          }
+        }
+
+        const [goal] = await db
+          .update(goals)
+          .set({ ...changes, ...(title ? { title } : {}), updatedAt: new Date() })
+          .where(and(eq(goals.id, open.goalId), eq(goals.ownerId, userId)))
+          .returning();
+        if (!goal) return { applied: false, error: 'That goal no longer exists.' };
+
+        await closeNegotiation(open.id, 'agreed');
+        // New days or a new time means the old alarm is wrong. Touching the
+        // goal also restarts the 7-day grace period, so the change gets a
+        // fair run before anything can be renegotiated again.
+        void syncGoalSchedule(goal);
+
+        return {
+          applied: true,
+          goalTitle: goal.title,
+          daysOfWeek: goal.daysOfWeek,
+          timeOfDay: goal.timeOfDay,
+          target: goal.target,
+          note_to_model: 'Confirm warmly in one line, in plain words, and wish them luck.',
+        };
+      },
+    }),
+
+    counterNegotiation: tool({
+      description:
+        "The user wants something DIFFERENT from what the bot proposed (e.g. 'no, keep 5 " +
+        "days but move it later'). Pass their counter-offer; it becomes the new proposal " +
+        'for them to confirm.',
+      inputSchema: z.object({
+        daysOfWeek: DAYS_OF_WEEK.optional(),
+        timeOfDay: TIME_OF_DAY.optional(),
+        target: z.number().min(0).optional(),
+        summary: z.string().max(300).describe('What they asked for, in one sentence'),
+      }),
+      execute: async ({ summary, ...changes }) => {
+        const open = await findOpenNegotiation(userId);
+        if (!open) return { recorded: false, error: 'There is no open proposal to counter.' };
+        if (Object.keys(changes).length === 0) {
+          return { recorded: false, error: 'No concrete change given — ask them what to change.' };
+        }
+
+        const round = await advanceRound(open.id, { ...changes, rationale: summary });
+
+        // Three rounds in, this is a disagreement rather than a negotiation.
+        // The bot stops rather than grinding on; the cooldown then leaves the
+        // goal alone for two weeks.
+        if (round > MAX_ROUNDS) {
+          await closeNegotiation(open.id, 'declined');
+          return {
+            recorded: true,
+            closed: true,
+            note_to_model:
+              "Say you'll leave the goal as it is for now and they can change it any time. " +
+              'Do not propose anything else.',
+          };
+        }
+
+        return {
+          recorded: true,
+          round,
+          ...changes,
+          note_to_model:
+            'Read their version back as the new proposal and ask them to confirm it. ' +
+            'Call acceptNegotiation when they do.',
+        };
+      },
+    }),
+
+    declineNegotiation: tool({
+      description:
+        "The user does NOT want to change the goal ('no, leave it', 'I want to keep it as " +
+        "is'). Closes the conversation and leaves the goal untouched.",
+      inputSchema: z.object({}),
+      execute: async () => {
+        const open = await findOpenNegotiation(userId);
+        if (!open) return { closed: false, error: 'There is no open proposal to decline.' };
+
+        await closeNegotiation(open.id, 'declined');
+        return {
+          closed: true,
+          note_to_model:
+            'Accept it gracefully in one line — no persuading, no second attempt. ' +
+            'They know where to find you.',
+        };
+      },
+    }),
+  };
+}
+
+export interface ToolContext {
+  /**
+   * Whether the bot is waiting on an answer to a goal proposal right now.
+   *
+   * The negotiation tools are only handed over when one is open. Two reasons,
+   * and the second matters more: every tool definition costs tokens in every
+   * request, and a model given an `acceptNegotiation` tool WILL eventually
+   * call it with nothing to accept — spending one of four allowed steps to
+   * be told "there is no open proposal". The cheapest way to stop a model
+   * doing something is not to offer it.
+   */
+  hasOpenNegotiation: boolean;
+}
+
+export function buildAssistantTools(
+  userId: string,
+  timezone: string,
+  context: ToolContext = { hasOpenNegotiation: false },
+): ToolSet {
   return withRepeatGuard({
     getGoals: tool({
       description: "List the user's active goals, with their schedule and target.",
@@ -751,6 +914,25 @@ export function buildAssistantTools(userId: string, timezone: string): ToolSet {
         };
       },
     }),
+
+    /**
+     * The user's side of a negotiation the BOT started.
+     *
+     * Spread in ONLY when a proposal is actually waiting: a tool that exists
+     * is a tool a model will eventually call, and "acceptNegotiation" with
+     * nothing to accept wastes one of four allowed steps to learn that.
+     *
+     * These three deliberately skip the draft-then-confirm gate, and the
+     * reason is precise: the proposal WAS the draft. The bot said exactly
+     * what it would change and asked; "yes" is the confirmation. Asking again
+     * would be asking twice.
+     *
+     * The safety property is kept a different way — `acceptNegotiation` takes
+     * NO arguments. What gets applied is read from the stored proposal, so
+     * the model cannot quietly apply something other than what the user was
+     * shown, even if it misreads the conversation.
+     */
+    ...(context.hasOpenNegotiation ? negotiationTools(userId) : {}),
 
     cancelPendingAction: tool({
       description: "Discard the user's currently pending drafted action without committing it.",

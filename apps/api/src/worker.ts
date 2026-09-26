@@ -13,6 +13,8 @@ import {
   followupJobIdFor,
   followupDelayMsFor,
   syncGoalSchedule,
+  DORMANCY_JOB,
+  DORMANCY_EVERY_MS,
   type ReminderJobData,
   type FollowupJobData,
 } from './queue/reminders.js';
@@ -23,6 +25,7 @@ import {
   goals,
   linkCodes,
   memories,
+  negotiations,
   pauseWindows,
   pendingActions,
   users,
@@ -36,6 +39,24 @@ import {
 } from './queue/memories.js';
 import { getSyncTarget } from './lib/memory/index.js';
 import { currentEmbeddingModel, embedText } from './lib/embeddings.js';
+import { findNewlyDormantUsers, goodbyeMessage, markDormant } from './lib/engagement.js';
+import { findSlippingGoals } from './lib/negotiation/trigger.js';
+import { composeProposal } from './lib/negotiation/propose.js';
+import {
+  closeNegotiation,
+  createNegotiation,
+  recordBotMessage,
+} from './lib/negotiation/state.js';
+import {
+  NEGOTIATION_ABANDON_JOB,
+  NEGOTIATION_NUDGE_JOB,
+  NEGOTIATION_SWEEP_JOB,
+  NEGOTIATION_SWEEP_EVERY_MS,
+  scheduleSilenceTimers,
+  type NegotiationJobData,
+} from './queue/negotiations.js';
+import { getMemoryStore } from './lib/memory/index.js';
+import { describeError } from './db/errors.js';
 import { isUuid } from './lib/validators.js';
 import { generateReminderMessage, type CheckInHistoryEntry } from './lib/ai.js';
 import {
@@ -168,6 +189,11 @@ async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
   const user = await findUser(goal.ownerId);
   if (!user) return 'skip: owner no longer exists';
 
+  // The bot has gone quiet for this person. Their schedules keep running —
+  // cheap, and it means everything resumes the instant they say something —
+  // but nothing is sent, and no AI call is made.
+  if (user.dormantSince) return 'skip: user dormant (no reply in 7+ days)';
+
   // The staleness check from the dual-write discussion. Recompute the
   // fingerprint from what the database says NOW and compare it exactly to what was
   // stamped into the job when it was scheduled. A mismatch means this alarm
@@ -278,6 +304,7 @@ async function handleFollowup(job: Job<FollowupJobData>): Promise<string> {
 
   const user = await findUser(goal.ownerId);
   if (!user?.telegramChatId) return 'skip: telegram not linked';
+  if (user.dormantSince) return 'skip: user dormant';
 
   await sendTelegramMessage(
     user.telegramChatId,
@@ -357,6 +384,201 @@ async function handleSyncMemory(job: Job<SyncMemoryJobData>): Promise<string> {
   });
 
   return `synced to ${target.name}`;
+}
+
+// ---------------------------------------------------------------------------
+// negotiation — the bot opening a conversation about a goal that isn't working
+// ---------------------------------------------------------------------------
+
+/**
+ * Evening only, in the user's own timezone.
+ *
+ * "This week hasn't gone well, shall we change it?" is a reflective message,
+ * and it lands very differently at 11am on a workday than after dinner. It
+ * also can't then collide with a morning reminder for the same goal.
+ */
+const PROPOSAL_EARLIEST_HOUR = 18;
+const PROPOSAL_LATEST_HOUR = 21;
+
+function isProposalHour(timezone: string): boolean {
+  const [hour] = localTimeInZone(timezone).split(':').map(Number);
+  return hour !== undefined && hour >= PROPOSAL_EARLIEST_HOUR && hour < PROPOSAL_LATEST_HOUR;
+}
+
+/**
+ * Finds goals that are slipping and opens ONE negotiation per user.
+ *
+ * Runs hourly so it can catch each user's evening wherever they are, and
+ * does nothing outside that window.
+ */
+async function handleNegotiationSweep(): Promise<string> {
+  const slipping = await findSlippingGoals();
+  if (slipping.length === 0) return 'no slipping goals';
+
+  const alreadyMessaged = new Set<string>();
+  let opened = 0;
+
+  for (const candidate of slipping) {
+    if (!isProposalHour(candidate.user.timezone)) continue;
+
+    // At most one proposal per user per sweep, even with three qualifying
+    // goals. Three renegotiation requests at once reads as an intervention,
+    // not as help — and the others will still be there tomorrow.
+    if (alreadyMessaged.has(candidate.user.id)) continue;
+
+    // Why the goal might be slipping, in the user's own words. The trigger
+    // knows THAT it slipped; this is the only source for WHY.
+    let memories: string[] = [];
+    try {
+      const hits = await getMemoryStore().search({
+        userId: candidate.user.id,
+        query: `struggling with ${candidate.goal.title}`,
+        limit: 3,
+      });
+      memories = hits.map((hit) => hit.content);
+    } catch (err) {
+      console.error('[negotiation] memory lookup failed:', describeError(err));
+    }
+
+    const proposal = await composeProposal(candidate, memories);
+    if (!proposal) continue;
+
+    // The row FIRST, then the message. If sending fails we have an open
+    // negotiation with nothing said, which the nudge repairs; the reverse —
+    // a message sent with no row — would be a proposal the bot cannot
+    // remember making.
+    const created = await createNegotiation({
+      goalId: candidate.goal.id,
+      ownerId: candidate.user.id,
+      proposal,
+      evidence: candidate.evidence as unknown as Record<string, unknown>,
+    });
+    // Another sweep beat us to this goal (the partial unique index).
+    if (!created) continue;
+
+    try {
+      await sendTelegramMessage(candidate.user.telegramChatId, proposal.message);
+    } catch (err) {
+      if (err instanceof TelegramPermanentError) {
+        await closeNegotiation(created.id, 'abandoned');
+        continue;
+      }
+      throw err; // transient: let BullMQ retry the whole sweep
+    }
+
+    // Into the conversation history, so a reply tomorrow — after a reminder
+    // and a check-in have come and gone — still has the proposal above it.
+    await recordBotMessage(candidate.user.id, proposal.message);
+    await scheduleSilenceTimers(created.id);
+
+    alreadyMessaged.add(candidate.user.id);
+    opened++;
+  }
+
+  return `opened ${opened} negotiation(s) of ${slipping.length} slipping goal(s)`;
+}
+
+/** One reminder that a proposal is still waiting. */
+async function handleNegotiationNudge(job: Job<NegotiationJobData>): Promise<string> {
+  const [negotiation] = await db
+    .select()
+    .from(negotiations)
+    .where(eq(negotiations.id, job.data.negotiationId));
+
+  // All the ways this alarm can be stale, checked against the database
+  // rather than assumed from the fact that the job fired.
+  if (!negotiation) return 'skip: negotiation gone';
+  if (negotiation.status !== 'proposed') return `skip: already ${negotiation.status}`;
+  if (negotiation.nudgedAt) return 'skip: already nudged';
+  // They replied since — the bot spoke last at a later time than this job
+  // was scheduled for.
+  if (negotiation.lastMessageAt.getTime() > job.timestamp) return 'skip: conversation moved on';
+
+  const user = await findUser(negotiation.ownerId);
+  if (!user?.telegramChatId || user.dormantSince) return 'skip: not contactable';
+
+  const [goal] = await db
+    .select({ title: goals.title })
+    .from(goals)
+    .where(eq(goals.id, negotiation.goalId));
+  if (!goal) return 'skip: goal deleted';
+
+  const message =
+    `Still thinking about ${goal.title}? No rush — just say yes, no, or tell me what ` +
+    `would work better and I'll sort it.`;
+
+  await sendTelegramMessage(user.telegramChatId, message);
+  await recordBotMessage(user.id, message);
+  await db
+    .update(negotiations)
+    .set({ nudgedAt: new Date(), updatedAt: new Date() })
+    .where(eq(negotiations.id, negotiation.id));
+
+  return 'nudged';
+}
+
+/**
+ * Closes a proposal nobody answered. Deliberately SILENT: a third message
+ * saying "I'll stop asking" is one more message to someone who has already
+ * shown they don't want to discuss it.
+ */
+async function handleNegotiationAbandon(job: Job<NegotiationJobData>): Promise<string> {
+  const [negotiation] = await db
+    .select()
+    .from(negotiations)
+    .where(eq(negotiations.id, job.data.negotiationId));
+
+  if (!negotiation) return 'skip: negotiation gone';
+  if (negotiation.status !== 'proposed') return `skip: already ${negotiation.status}`;
+  if (negotiation.lastMessageAt.getTime() > job.timestamp) return 'skip: conversation moved on';
+
+  await closeNegotiation(negotiation.id, 'abandoned');
+  // The cooldown runs from here, so the goal won't be raised again for two
+  // weeks — silence is an answer, and it gets respected.
+  return 'abandoned after 72h of silence';
+}
+
+// ---------------------------------------------------------------------------
+// dormancy — stop talking to someone who has stopped listening
+// ---------------------------------------------------------------------------
+
+/**
+ * Sends ONE goodbye to users who have been silent for a week, then stops
+ * reminding them until they say something.
+ *
+ * A proactive bot is the only part of this app that speaks first, so it is
+ * the only part that needs a rule for when to stop. Reminders arriving for
+ * weeks after someone stopped listening is how an app gets muted or blocked,
+ * and every unread AI-written reminder costs money.
+ *
+ * Runs hourly rather than daily, because it only acts during the user's own
+ * waking hours — a bot that goes quiet at 4am has managed to be annoying on
+ * the way out.
+ */
+async function handleDormancySweep(): Promise<string> {
+  const candidates = await findNewlyDormantUsers();
+  let sent = 0;
+
+  for (const user of candidates) {
+    try {
+      await sendTelegramMessage(user.telegramChatId, goodbyeMessage(user.displayName));
+      // Marked only AFTER the message is delivered: if the send fails, the
+      // next sweep should try again rather than silently going quiet.
+      await markDormant(user.id);
+      sent++;
+    } catch (err) {
+      if (err instanceof TelegramPermanentError) {
+        // They blocked the bot, which is an even clearer "stop" — no message
+        // is possible, so just go quiet.
+        await markDormant(user.id);
+        sent++;
+        continue;
+      }
+      console.error(`[dormancy] could not message ${user.id}:`, describeError(err));
+    }
+  }
+
+  return `${sent} user(s) went dormant`;
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +693,22 @@ async function main() {
     { name: 'reconcile', opts: RETRY_OPTS },
   );
 
+  // Hourly, because it acts on each user's LOCAL clock: a single daily run
+  // would land at 4am for someone.
+  await reminderQueue.upsertJobScheduler(
+    'system-dormancy',
+    { every: DORMANCY_EVERY_MS },
+    { name: DORMANCY_JOB, opts: RETRY_OPTS },
+  );
+
+  // Also hourly, for the same reason: it only acts during each user's
+  // evening, which no single daily run could cover across timezones.
+  await reminderQueue.upsertJobScheduler(
+    'system-negotiation',
+    { every: NEGOTIATION_SWEEP_EVERY_MS },
+    { name: NEGOTIATION_SWEEP_JOB, opts: RETRY_OPTS },
+  );
+
   const worker = new Worker(
     QUEUE_NAME,
     async (job: Job) => {
@@ -482,6 +720,14 @@ async function main() {
             return await handleFollowup(job as Job<FollowupJobData>);
           case 'reconcile':
             return await handleReconcile();
+          case DORMANCY_JOB:
+            return await handleDormancySweep();
+          case NEGOTIATION_SWEEP_JOB:
+            return await handleNegotiationSweep();
+          case NEGOTIATION_NUDGE_JOB:
+            return await handleNegotiationNudge(job as Job<NegotiationJobData>);
+          case NEGOTIATION_ABANDON_JOB:
+            return await handleNegotiationAbandon(job as Job<NegotiationJobData>);
           case EMBED_MEMORY_JOB:
             return await handleEmbedMemory(job as Job<EmbedMemoryJobData>);
           case SYNC_MEMORY_JOB:

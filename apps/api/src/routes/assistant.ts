@@ -9,6 +9,8 @@ import { describeError } from '../db/errors.js';
 import { buildAssistantTools, findLivePendingAction } from '../lib/assistant-tools.js';
 import { getMemoryStore } from '../lib/memory/index.js';
 import { loadRecentTurns, saveTurn } from '../lib/conversation.js';
+import { touchUserActivity } from '../lib/engagement.js';
+import { findOpenNegotiation } from '../lib/negotiation/state.js';
 import { requireAuth } from '../middleware/auth.js';
 import { env } from '../lib/env.js';
 
@@ -60,6 +62,16 @@ const MIN_AUTOSAVE_LENGTH = 25;
 const ACKNOWLEDGEMENT = /^(y(es|eah|ep|up)?|no(pe)?|ok(ay)?|sure|thanks|ty|cool|great|nice|done|got it|go ahead|sounds good)\b/i;
 
 /**
+ * Is there anything here worth searching memory for? "yes", "ok", "9pm" and
+ * "do it" carry no topic — embedding them spends a request and returns the
+ * nearest rows to nothing in particular.
+ */
+function isSearchableMessage(message: string): boolean {
+  const text = message.trim();
+  return text.length >= 12 && !ACKNOWLEDGEMENT.test(text);
+}
+
+/**
  * Should this message be remembered without the model being asked?
  *
  * The model has a `rememberNote` tool and keeps forgetting to use it — it
@@ -73,16 +85,6 @@ const ACKNOWLEDGEMENT = /^(y(es|eah|ep|up)?|no(pe)?|ok(ay)?|sure|thanks|ty|cool|
  * store one sentence. Storing a bit too much is cheap: a weak memory simply
  * loses the similarity contest at retrieval time.
  */
-/**
- * Is there anything here worth searching memory for? "yes", "ok", "9pm" and
- * "do it" carry no topic — embedding them spends a request and returns the
- * nearest rows to nothing in particular.
- */
-function isSearchableMessage(message: string): boolean {
-  const text = message.trim();
-  return text.length >= 12 && !ACKNOWLEDGEMENT.test(text);
-}
-
 function shouldAutoRemember(message: string): boolean {
   const text = message.trim();
   if (text.length < MIN_AUTOSAVE_LENGTH) return false;
@@ -178,6 +180,11 @@ assistantRouter.post('/ask', async (req, res) => {
     return;
   }
 
+  // Any message is a sign of life: if the bot had gone quiet after a week of
+  // silence, this is what brings the reminders back. Not awaited — waking up
+  // is bookkeeping, and must never fail someone's message.
+  void touchUserActivity(user.id);
+
   // Only a draft that hasn't expired counts. An expired one is invisible
   // here and unconfirmable in the tools, even before the sweep deletes it.
   const pending = await findLivePendingAction(user.id);
@@ -199,6 +206,8 @@ assistantRouter.post('/ask', async (req, res) => {
    * per message (~$0.000001), and a failure here must never break the chat —
    * an assistant with no memory is still a working assistant.
    */
+  const negotiation = await findOpenNegotiation(user.id);
+
   let recalled: Awaited<ReturnType<ReturnType<typeof getMemoryStore>['search']>> = [];
   let history: Awaited<ReturnType<typeof loadRecentTurns>> = [];
   try {
@@ -238,6 +247,20 @@ assistantRouter.post('/ask', async (req, res) => {
     pending
       ? `There is a PENDING, unconfirmed draft: ${JSON.stringify(pending.kind)} — ${JSON.stringify(pending.payload)}. If the user's message confirms it, call confirmPendingAction. If they reject or change their mind, call cancelPendingAction.`
       : 'There is no pending draft right now.',
+    // An OPEN negotiation is loaded by state, not by which message the user
+    // replied to — so "yeah ok" works two days and several reminders later,
+    // which is how people actually answer.
+    negotiation
+      ? [
+          `YOU ALREADY PROPOSED a change to the goal "${negotiation.goalTitle}" ` +
+            `(round ${negotiation.round}) and they have not answered yet:`,
+          JSON.stringify(negotiation.proposal),
+          'If this message agrees → acceptNegotiation. If they want different terms →',
+          'counterNegotiation. If they want no change at all → declineNegotiation.',
+          'If the message is about something else entirely, just answer that and leave the',
+          'proposal open.',
+        ].join('\n')
+      : 'There is no open goal negotiation.',
     // Dated, because "you mentioned this in August" and "you said this
     // yesterday" call for very different responses. Marked as possibly
     // irrelevant so a weak match doesn't get forced into the answer.
@@ -307,7 +330,9 @@ assistantRouter.post('/ask', async (req, res) => {
       // what they just said. This is what makes "actually make it 10pm"
       // resolvable — "it" is in the message above.
       messages: [...history, { role: 'user', content: parsed.data.message }],
-      tools: buildAssistantTools(user.id, user.timezone),
+      tools: buildAssistantTools(user.id, user.timezone, {
+        hasOpenNegotiation: Boolean(negotiation),
+      }),
       stopWhen: stepCountIs(MAX_STEPS),
       timeout: REQUEST_TIMEOUT_MS,
       maxRetries: 0,
@@ -334,7 +359,8 @@ assistantRouter.post('/ask', async (req, res) => {
       }),
     );
     console.log(
-      `[assistant] ${history.length} prior turn(s) | preloaded ${recalled.length} memor(ies)` +
+      `[assistant] ${negotiation ? `negotiation open (round ${negotiation.round}) | ` : ''}` +
+        `${history.length} prior turn(s) | preloaded ${recalled.length} memor(ies)` +
         (recalled[0] ? ` (top ${recalled[0].score.toFixed(3)})` : '') +
         ` | ${toolCalls.length ? toolCalls.join(' → ') : 'no tools called'}`,
     );

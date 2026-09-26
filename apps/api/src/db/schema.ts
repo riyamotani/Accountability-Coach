@@ -11,6 +11,7 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
   uuid,
   vector,
 } from 'drizzle-orm/pg-core';
@@ -104,6 +105,21 @@ export const users = pgTable(
     // as distinct from each other, so any number of unlinked users can have
     // NULL here. Mongo needed `sparse: true` for the same effect.
     telegramChatId: text('telegram_chat_id').unique(),
+
+    /**
+     * Set when the bot has gone quiet because the user stopped responding,
+     * and cleared the moment they do anything again.
+     *
+     * Without this, someone who ignores the bot for a month keeps receiving
+     * daily reminders — which is how an app gets muted or blocked, and it
+     * spends AI budget on messages nobody reads. Silence is an answer.
+     *
+     * A column rather than a derived query because it records that the ONE
+     * goodbye message was already sent; recomputing "has been silent for 7
+     * days" would send it again every single day.
+     */
+    dormantSince: timestamp('dormant_since', { withTimezone: true }),
+
     ...timestamps(),
   },
   (t) => [
@@ -322,6 +338,105 @@ export const pendingActions = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// negotiations — the bot renegotiating a goal that isn't working
+// ---------------------------------------------------------------------------
+
+/**
+ * Where a negotiation currently is. `proposed` is the only OPEN state; the
+ * other three are terminal and all start the cooldown before this goal can
+ * be raised again.
+ */
+export const NEGOTIATION_STATUSES = ['proposed', 'agreed', 'declined', 'abandoned'] as const;
+export type NegotiationStatus = (typeof NEGOTIATION_STATUSES)[number];
+
+/**
+ * The durable half of the negotiation loop.
+ *
+ * The bot notices a goal is being missed, proposes a change, and the user
+ * replies — maybe in ten minutes, maybe tomorrow. Between those moments
+ * NOTHING is running: the model is stateless, the process may restart, days
+ * may pass. So "we are mid-negotiation, round 2, this is what was proposed"
+ * has to live in a row, and a job has to wake it up.
+ *
+ * That separation is the whole design: CODE decides when to speak and
+ * enforces the rules that need guarantees (cooldown, round limit, applying
+ * the agreed change exactly once); the MODEL decides what to say inside a
+ * turn. A prompt can be persuaded to do the former; it cannot be relied on.
+ */
+export const negotiations = pgTable(
+  'negotiations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    goalId: uuid('goal_id')
+      .notNull()
+      .references(() => goals.id, { onDelete: 'cascade' }),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+
+    status: text('status').$type<NegotiationStatus>().notNull().default('proposed'),
+
+    /**
+     * Counting from 1. Each user counter-offer that the bot answers is a new
+     * round; at MAX_ROUNDS the bot stops and leaves the goal alone, so a
+     * disagreement can't become an endless exchange.
+     */
+    round: smallint('round').notNull().default(1),
+
+    /**
+     * What the bot is proposing, as `{ kind, ...fields }`. jsonb rather than
+     * columns because the SHAPES will multiply: today "fewer days" or "a
+     * different time", later "lower the monthly budget". A new kind of
+     * proposal should be a new payload through this same machine, not a new
+     * machine.
+     */
+    proposal: jsonb('proposal').$type<Record<string, unknown>>().notNull(),
+
+    /**
+     * The numbers that triggered it ("1 of 4 due days in the last fortnight"),
+     * frozen at trigger time. Stored rather than recomputed so the bot can
+     * quote the same figures three days later, when a check-in since would
+     * otherwise change them mid-conversation.
+     */
+    evidence: jsonb('evidence').$type<Record<string, unknown>>().notNull(),
+
+    /** When the bot last said something — the clock for nudging and giving up. */
+    lastMessageAt: timestamp('last_message_at', { withTimezone: true }).notNull().defaultNow(),
+    /** Set when the single reminder-of-a-pending-proposal has been sent. */
+    nudgedAt: timestamp('nudged_at', { withTimezone: true }),
+    /** Set when the negotiation reached a terminal state. Drives the cooldown. */
+    closedAt: timestamp('closed_at', { withTimezone: true }),
+
+    ...timestamps(),
+  },
+  (t) => [
+    /**
+     * At most ONE open negotiation per goal, enforced by the database.
+     *
+     * A partial unique index: the uniqueness applies only to rows where
+     * status = 'proposed', so a goal can have many closed negotiations in its
+     * history but never two live ones. Without it, the daily sweep racing
+     * itself (or running on two workers) could open a second conversation
+     * about the same goal.
+     */
+    uniqueIndex('negotiations_one_open_per_goal')
+      .on(t.goalId)
+      .where(sql`status = 'proposed'`),
+
+    // "Has this goal been negotiated recently?" — the cooldown check.
+    index('negotiations_goal_created_idx').on(t.goalId, t.createdAt.desc()),
+    // "Does this user have an open negotiation?" — asked on every message.
+    index('negotiations_owner_status_idx').on(t.ownerId, t.status),
+
+    check(
+      'negotiations_status_valid',
+      sql.raw(`"status" IN (${NEGOTIATION_STATUSES.map((s) => `'${s}'`).join(', ')})`),
+    ),
+    check('negotiations_round_positive', sql`${t.round} >= 1`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // chat_messages — the running conversation with the assistant
 // ---------------------------------------------------------------------------
 
@@ -450,3 +565,4 @@ export type LinkCodeRow = typeof linkCodes.$inferSelect;
 export type PendingActionRow = typeof pendingActions.$inferSelect;
 export type MemoryRow = typeof memories.$inferSelect;
 export type ChatMessageRow = typeof chatMessages.$inferSelect;
+export type NegotiationRow = typeof negotiations.$inferSelect;

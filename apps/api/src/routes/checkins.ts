@@ -6,6 +6,7 @@ import { checkIns, goals } from '../db/schema.js';
 import { toCheckIn } from '../lib/serialize.js';
 import { isUuid } from '../lib/validators.js';
 import { requireAuth } from '../middleware/auth.js';
+import { touchUserActivity } from '../lib/engagement.js';
 
 export const checkInsRouter = Router();
 
@@ -108,6 +109,10 @@ checkInsRouter.put('/', async (req, res) => {
     })
     .returning();
   if (!checkIn) throw new Error('upsert returned no row');
+
+  // Ticking something off counts as a sign of life wherever it came from —
+  // a Telegram button, the dashboard, or the assistant confirming a draft.
+  void touchUserActivity(req.userId!);
 
   res.json(toCheckIn(checkIn));
 });

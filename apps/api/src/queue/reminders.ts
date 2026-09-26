@@ -9,6 +9,15 @@ import { goals, users, type GoalRow } from '../db/schema.js';
 export const QUEUE_NAME = 'reminders';
 
 /**
+ * Hourly sweep for things that should happen "about once a day, at a
+ * reasonable hour". Hourly rather than daily because users live in different
+ * timezones: the handler checks each user's LOCAL clock and acts only during
+ * their waking hours, which a single daily run could never do.
+ */
+export const DORMANCY_JOB = 'dormancy';
+export const DORMANCY_EVERY_MS = 60 * 60 * 1000;
+
+/**
  * One queue, three job types — distinguished by `job.name`, not by separate
  * queues:
  *
