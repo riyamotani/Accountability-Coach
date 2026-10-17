@@ -12,3 +12,6 @@ dist/
 CLAUDE.md
 LEARNINGS.md
 ARCHITECTURE.md
+
+# Production secrets live only on the server.
+.env.production

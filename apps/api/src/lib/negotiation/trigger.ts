@@ -270,6 +270,7 @@ export interface SlippingGoal {
     timeOfDay: string;
     target: number | null;
     targetUnit: string | null;
+    description: string | null;
   };
   user: { id: string; timezone: string; telegramChatId: string; displayName: string };
   evidence: GoalEvidence;
@@ -290,6 +291,7 @@ export async function findSlippingGoals(): Promise<SlippingGoal[]> {
       timeOfDay: goals.timeOfDay,
       target: goals.target,
       targetUnit: goals.targetUnit,
+      description: goals.description,
       goalCreatedAt: goals.createdAt,
       goalUpdatedAt: goals.updatedAt,
       userTimezone: users.timezone,
@@ -337,6 +339,7 @@ export async function findSlippingGoals(): Promise<SlippingGoal[]> {
         timeOfDay: row.timeOfDay,
         target: row.target,
         targetUnit: row.targetUnit,
+        description: row.description,
       },
       user: {
         id: row.ownerId,

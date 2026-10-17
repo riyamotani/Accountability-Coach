@@ -1,0 +1,25 @@
+# What Docker must NOT copy into the build.
+#
+# Everything the image needs is rebuilt inside it (npm ci, tsc, next build),
+# so local build output would only add size — and worse, a host-built
+# node_modules can contain Windows binaries that break on Linux.
+
+node_modules
+**/node_modules
+**/dist
+**/.next
+**/*.tsbuildinfo
+
+# Secrets never go into an image. A layer is effectively public to anyone who
+# can pull it, and deleting a file in a later layer does not remove it from
+# the earlier one. Configuration arrives at RUN time, from the environment.
+.env
+.env.*
+!.env.example
+
+.git
+.github
+*.log
+CLAUDE.md
+LEARNINGS.md
+ARCHITECTURE.md

@@ -2,6 +2,7 @@ import { createGateway, generateObject } from 'ai';
 import { z } from 'zod';
 import { formatTimeOfDay } from '@coach/shared';
 import { env } from '../env.js';
+import { providerOptionsFor } from '../model-options.js';
 import type { SlippingGoal } from './trigger.js';
 
 /**
@@ -65,6 +66,10 @@ function describeEvidence({ goal, evidence }: SlippingGoal): string {
     `Goal: "${goal.title}"`,
     `Currently: ${goal.daysOfWeek.map((d) => DAY_NAMES[d]).join(', ')} at ${formatTimeOfDay(goal.timeOfDay)}`,
     goal.target != null ? `Target each time: ${goal.target} ${goal.targetUnit ?? ''}`.trim() : '',
+    // Their own reason. A proposal that keeps the PURPOSE intact ("still
+    // ready for the March interviews, just 3 days a week") is far easier to
+    // say yes to than one that only shrinks the numbers.
+    goal.description ? `Why they set this goal: "${goal.description.slice(0, 300)}"` : '',
     '',
     `Last ${evidence.due} due occurrences (${evidence.windowFrom} to ${evidence.windowTo}):`,
     ...evidence.occurrences.map((o) => {
@@ -98,8 +103,12 @@ export async function composeProposal(
   gateway ??= createGateway({ apiKey: env.aiGatewayApiKey });
 
   try {
+    const providerOptions = providerOptionsFor(env.aiAssistantModel);
     const { object } = await generateObject({
-      model: gateway(env.aiModel),
+      // Judgment, not just wording: what change fits the evidence. Same
+      // model as the assistant, for the same reason.
+      model: gateway(env.aiAssistantModel),
+      ...(providerOptions ? { providerOptions } : {}),
       schema: proposalSchema,
       system: [
         `You are a warm, practical accountability coach talking to ${slipping.user.displayName}`,

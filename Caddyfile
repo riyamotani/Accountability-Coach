@@ -1,0 +1,37 @@
+# Caddy is the only container reachable from the internet.
+#
+# It does two jobs:
+#   1. HTTPS. Given a real hostname, Caddy obtains a certificate from Let's
+#      Encrypt on first start and renews it before it expires — no certbot,
+#      no cron job. SITE_ADDRESS can be a free `<your-ip>.sslip.io` name, so
+#      no domain has to be bought.
+#   2. Routing. One domain, two apps: /api/* goes to the Express API, and
+#      everything else goes to the Next.js dashboard. Same origin means the
+#      browser never makes a cross-origin request, so there's no CORS to
+#      configure and nothing to break.
+#
+# The API, web, worker, bot and Redis are NOT published to the internet at
+# all. They're reachable only on Docker's private network, by service name
+# (api:4000, web:3000) — Caddy is the single way in.
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# handle_path STRIPS the prefix: the browser asks for /api/goals, the API
+	# receives /goals — exactly the routes it already has.
+	handle_path /api/* {
+		reverse_proxy api:4000
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+
+	# Basic protection headers on every response.
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}

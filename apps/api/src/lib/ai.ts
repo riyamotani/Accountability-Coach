@@ -34,6 +34,12 @@ export interface ReminderContext {
   // pass goal.target straight through.
   target?: number | null | undefined;
   targetUnit?: string | null | undefined;
+  /**
+   * The user's own reason for the goal, if they gave one. A reminder that
+   * knows WHY someone is doing something can point at it, instead of only
+   * naming the task.
+   */
+  description?: string | null | undefined;
   /** Last ~7 days, oldest first. Empty is fine — a brand new goal has none. */
   recentHistory: CheckInHistoryEntry[];
 }
@@ -54,6 +60,9 @@ export function buildPrompt(ctx: ReminderContext): string {
   const target =
     ctx.target && ctx.targetUnit ? `Target: ${ctx.target} ${ctx.targetUnit}.` : '';
 
+  // Capped: it's context for one sentence, not something to recite.
+  const why = ctx.description ? `Why it matters to them: "${ctx.description.slice(0, 300)}"` : '';
+
   const history =
     ctx.recentHistory.length === 0
       ? 'No check-in history yet — this may be a new goal.'
@@ -62,6 +71,7 @@ export function buildPrompt(ctx: ReminderContext): string {
   return [
     `You are a supportive accountability coach sending a short reminder`,
     `for the goal "${ctx.goalTitle}". ${target}`,
+    why,
     ``,
     `Recent check-ins:`,
     history,

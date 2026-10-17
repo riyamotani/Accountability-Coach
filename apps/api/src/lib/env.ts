@@ -77,6 +77,16 @@ export const env = {
   // 5s timeout); and from an established provider.
   aiModel: process.env.AI_MODEL ?? 'mistral/ministral-14b',
 
+  // The chat assistant and negotiation proposals: the two places where the
+  // model must CHOOSE — which tool, which change to propose — rather than
+  // just write a sentence. ministral-14b kept getting that wrong (re-drafting
+  // instead of confirming, skipping tools). A reasoning model is better at
+  // it, and slower and pricier per call, which is why it is NOT used for the
+  // reminder line above: that has a 5-second timeout and a 120-token cap, and
+  // hidden reasoning tokens would eat both.
+  // Defaults to AI_MODEL, so leaving this unset changes nothing.
+  aiAssistantModel: process.env.AI_ASSISTANT_MODEL ?? process.env.AI_MODEL ?? 'mistral/ministral-14b',
+
   // Turns a memory into the numbers we search by. Changing this invalidates
   // every stored vector — they aren't comparable across models — so a change
   // means a migration of the column's size plus re-embedding everything.

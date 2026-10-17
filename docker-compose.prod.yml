@@ -1,0 +1,164 @@
+# Production: the whole app on one server.
+#
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+#
+# `--env-file` and each service's `env_file:` are two DIFFERENT mechanisms,
+# and both use the same file here. `--env-file` fills in ${...} placeholders
+# in THIS file (like SITE_ADDRESS below); `env_file:` puts variables inside
+# the running containers. Compose only reads a `.env` automatically for the
+# first job, so without the flag ${SITE_ADDRESS} would be empty.
+#
+# (docker-compose.yml, next to this file, is the DEVELOPMENT setup — just
+# Postgres and Redis, with the app running on your machine.)
+#
+# Postgres is deliberately NOT here: it runs on Neon, a managed service.
+# Postgres holds everything that matters — goals, check-ins, memories — and
+# a managed database comes with backups and point-in-time restore that would
+# otherwise be ours to build. Redis stays local because nearly everything in
+# it is rebuilt from Postgres by the reconcile job.
+#
+# Configuration comes from .env.production on the server, which is never
+# committed. See .env.production.example for what it needs.
+
+# Its own project name. Compose otherwise names the project after the folder,
+# which the DEVELOPMENT compose file shares — and both define a `redis`
+# service, so starting this stack would quietly replace the dev Redis
+# container instead of running beside it. A separate name also keeps the two
+# stacks' volumes (and so their data) apart.
+name: coach-prod
+
+x-app: &app
+  build:
+    context: .
+    target: app
+  image: coach-app
+  restart: unless-stopped
+  env_file: .env.production
+  environment:
+    # Inside Docker's network, services find each other by NAME. The empty
+    # username before the colon is Redis's convention for "password only".
+    REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env.production}@redis:6379
+    API_URL: http://api:4000
+  depends_on:
+    redis:
+      condition: service_healthy
+
+services:
+  # Applies database migrations, then exits. Everything that talks to the
+  # database waits for it to finish SUCCESSFULLY, so new code never runs
+  # against an old schema — and a failed migration stops the deploy instead
+  # of starting a half-broken app.
+  migrate:
+    <<: *app
+    restart: 'no'
+    command: ['node', 'apps/api/dist/migrate.js']
+
+  api:
+    <<: *app
+    command: ['node', 'apps/api/dist/server.js']
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # No curl in the Alpine image, so Node itself checks /health — which
+      # actually queries the database, not just "is the process alive".
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:4000/health').then(r=>r.json()).then(b=>process.exit(b.db?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # The same image as the API, running a different program: this one never
+  # answers HTTP, it waits on Redis for jobs to come due.
+  worker:
+    <<: *app
+    command: ['node', 'apps/api/dist/worker.js']
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Long polling, exactly as in development: the bot asks Telegram for new
+  # messages, so it needs no public URL and no webhook.
+  bot:
+    <<: *app
+    command: ['node', 'apps/bot/dist/index.js']
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      target: web
+    image: coach-web
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # appendonly: write every change to disk, so a restart keeps the queued
+    # jobs — follow-ups, negotiation nudges — that are NOT rebuilt from
+    # Postgres. noeviction: BullMQ requires it; the default policy is the
+    # same, but stating it means a config change can't silently start
+    # deleting jobs under memory pressure.
+    #
+    # requirepass: Redis is NOT published to the internet (no `ports:`), so
+    # today only other containers can reach it. The password is for the day
+    # that stops being true — someone adding `ports: 6379:6379` to debug
+    # something. An open, passwordless Redis is one of the most commonly
+    # exploited services on the internet; one line here means one config
+    # mistake isn't a breach.
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env.production}
+    environment:
+      # Only so the healthcheck below can authenticate. REDISCLI_AUTH is read
+      # by redis-cli itself, which keeps the password out of the process list.
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # The ONLY published ports. 80 is needed too: Let's Encrypt verifies
+    # the domain over plain HTTP, and Caddy redirects everything else to 443.
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?Set SITE_ADDRESS in .env.production and pass --env-file .env.production}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates live here. Losing this volume means re-requesting them,
+      # and Let's Encrypt rate-limits repeated requests for the same name.
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - web
+      - api
+
+volumes:
+  redis-data:
+  caddy-data:
+  caddy-config:

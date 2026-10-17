@@ -11,6 +11,7 @@ import { getMemoryStore } from '../lib/memory/index.js';
 import { loadRecentTurns, saveTurn } from '../lib/conversation.js';
 import { touchUserActivity } from '../lib/engagement.js';
 import { findOpenNegotiation } from '../lib/negotiation/state.js';
+import { providerOptionsFor } from '../lib/model-options.js';
 import { requireAuth } from '../middleware/auth.js';
 import { env } from '../lib/env.js';
 
@@ -23,7 +24,11 @@ const askSchema = z.object({ message: z.string().min(1).max(1000) });
 // Same reasoning as the reminder timeout in lib/ai.ts, just a wider budget:
 // this can take a few tool-calling round trips, but a request handler still
 // needs a ceiling.
-const REQUEST_TIMEOUT_MS = 15000;
+// 30s rather than the original 15: the assistant can run on a REASONING model
+// (see AI_ASSISTANT_MODEL), which thinks before each step, and a turn can have
+// two or three steps. The log line records the real duration of every turn,
+// so this number can be tuned from evidence rather than guessed.
+const REQUEST_TIMEOUT_MS = 30000;
 
 /**
  * Model calls allowed per message, including every tool round trip.
@@ -60,6 +65,27 @@ const MIN_AUTOSAVE_LENGTH = 25;
 
 /** Replies that are pure acknowledgement, whatever their length. */
 const ACKNOWLEDGEMENT = /^(y(es|eah|ep|up)?|no(pe)?|ok(ay)?|sure|thanks|ty|cool|great|nice|done|got it|go ahead|sounds good)\b/i;
+
+/**
+ * A short message that does nothing but agree: "yes", "looks good", "ok do
+ * it", "sounds good 👍". Anything carrying a condition or a change ("yes but
+ * at 10", "ok, make it 3 days") is NOT a plain confirmation and falls through
+ * to the model, because then there is something to interpret.
+ */
+const PLAIN_AGREEMENT =
+  /^(y(es|eah|ep|up)?|ok(ay)?|sure|confirm(ed)?|do it|go ahead|sounds good|looks good|perfect|great|done|correct|that'?s (right|good|fine)|yes please|please do|lgtm)\b/i;
+const CONDITION_WORDS = /\b(but|no|not|don'?t|change|instead|except|actually|wait|only|make it|rather)\b/i;
+
+function isPlainConfirmation(message: string): boolean {
+  const text = message.trim();
+  return (
+    text.length <= 40 &&
+    PLAIN_AGREEMENT.test(text) &&
+    !CONDITION_WORDS.test(text) &&
+    // A number almost always means new terms ("yes, 3 days").
+    !/\d/.test(text)
+  );
+}
 
 /**
  * Is there anything here worth searching memory for? "yes", "ok", "9pm" and
@@ -163,6 +189,11 @@ function rateLimitRetrySeconds(err: unknown): number | undefined {
  * hand the model its tools, run the loop, return what it said.
  */
 assistantRouter.post('/ask', async (req, res) => {
+  // Captured FIRST, before anything is drafted: the line between "things the
+  // user has already seen" and "things created during this reply". Only the
+  // former can be confirmed — see ToolContext.turnStartedAt.
+  const turnStartedAt = new Date();
+
   const parsed = askSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
@@ -278,9 +309,36 @@ assistantRouter.post('/ask', async (req, res) => {
 
   gateway ??= createGateway({ apiKey: env.aiGatewayApiKey });
 
+  /**
+   * A plain "yes" while exactly one thing is waiting for an answer is not a
+   * judgment call, so the model doesn't get to make it.
+   *
+   * Seen live: a draft of two goals, the user said "looks good", and the
+   * model drafted them AGAIN (renaming one) and asked for confirmation a
+   * second time — creating nothing. Instructions already said "confirm when
+   * they say yes". This is the sixth time in this project that something
+   * which MUST happen was left to the model and didn't happen; the fix every
+   * time has been to move it into code.
+   *
+   * The model is forced to call the right tool on its FIRST step, then writes
+   * the reply itself from the real result. If a draft AND a negotiation are
+   * both open, "yes" is genuinely ambiguous, so nothing is forced.
+   */
+  const forcedTool =
+    isPlainConfirmation(parsed.data.message) && Boolean(pending) !== Boolean(negotiation)
+      ? pending
+        ? 'confirmPendingAction'
+        : 'acceptNegotiation'
+      : undefined;
+
   try {
+    const startedAt = Date.now();
+    const providerOptions = providerOptionsFor(env.aiAssistantModel);
     const result = await generateText({
-      model: gateway(env.aiModel),
+      // The assistant model, not the reminder model: this is where tools get
+      // chosen, which is what the cheaper model kept getting wrong.
+      model: gateway(env.aiAssistantModel),
+      ...(providerOptions ? { providerOptions } : {}),
       instructions: [
         'You are a warm, upbeat accountability coach chatting with the user over Telegram,',
         'like a friend who genuinely wants them to win.',
@@ -302,6 +360,20 @@ assistantRouter.post('/ask', async (req, res) => {
         '- If the user asks you to change something, call the matching propose* tool.',
         '  NEVER claim something is done unless a confirmPendingAction or a propose*',
         '  tool result says so.',
+        '',
+        // What the app does BY ITSELF. Without this the model treats
+        // reminders as an optional extra — seen live: it offered "want
+        // reminders?" after creating goals, and when the user said yes it
+        // re-drafted the same goals, because it had nothing else to attach
+        // "reminders" to. A model can't avoid offering what it doesn't know
+        // already exists.
+        'What happens automatically — never offer these as extras, they are already on:',
+        '- Every active goal gets a Telegram reminder at its time, on its days, and a',
+        '  follow-up later if they have not checked in.',
+        '- If a goal keeps being missed, you will suggest adjusting it (they do not set this up).',
+        '- Reminders pause during a pause window, and stop entirely after a week of silence',
+        '  until they message again.',
+        'So after creating a goal, just confirm it — do not ask whether they want reminders.',
         '',
         'Changing things (all of this works here in chat — never tell them to use a website):',
         '- New goal: proposeGoal. Ask for whatever is missing first — what, which days,',
@@ -332,8 +404,20 @@ assistantRouter.post('/ask', async (req, res) => {
       messages: [...history, { role: 'user', content: parsed.data.message }],
       tools: buildAssistantTools(user.id, user.timezone, {
         hasOpenNegotiation: Boolean(negotiation),
+        turnStartedAt,
       }),
       stopWhen: stepCountIs(MAX_STEPS),
+      // Step 0 may be forced to a tool (see forcedTool). The LAST step is
+      // forced to text: seen live, a turn spent all four steps on tool calls
+      // and the user got the empty-reply fallback. Whatever happened before,
+      // the final step reports it.
+      prepareStep: ({ stepNumber }: { stepNumber: number }) => {
+        if (stepNumber === MAX_STEPS - 1) return { toolChoice: 'none' as const };
+        if (stepNumber === 0 && forcedTool) {
+          return { toolChoice: { type: 'tool' as const, toolName: forcedTool } };
+        }
+        return undefined;
+      },
       timeout: REQUEST_TIMEOUT_MS,
       maxRetries: 0,
     });
@@ -359,7 +443,11 @@ assistantRouter.post('/ask', async (req, res) => {
       }),
     );
     console.log(
-      `[assistant] ${negotiation ? `negotiation open (round ${negotiation.round}) | ` : ''}` +
+      // Model and wall-clock time on every line: switching to a reasoning
+      // model is a latency trade, and this is where it shows.
+      `[assistant] ${env.aiAssistantModel} ${Date.now() - startedAt}ms | ` +
+        `${forcedTool ? `forced ${forcedTool} | ` : ''}` +
+        `${negotiation ? `negotiation open (round ${negotiation.round}) | ` : ''}` +
         `${history.length} prior turn(s) | preloaded ${recalled.length} memor(ies)` +
         (recalled[0] ? ` (top ${recalled[0].score.toFixed(3)})` : '') +
         ` | ${toolCalls.length ? toolCalls.join(' → ') : 'no tools called'}`,

@@ -46,6 +46,7 @@ const rows = await db
     timeOfDay: goals.timeOfDay,
     target: goals.target,
     targetUnit: goals.targetUnit,
+    description: goals.description,
     timezone: users.timezone,
     telegramChatId: users.telegramChatId,
     displayName: users.displayName,
@@ -87,6 +88,7 @@ const slipping = {
     timeOfDay: row.timeOfDay,
     target: row.target,
     targetUnit: row.targetUnit,
+    description: row.description,
   },
   user: {
     id: row.ownerId,

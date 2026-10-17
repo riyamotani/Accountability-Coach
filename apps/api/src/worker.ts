@@ -48,6 +48,7 @@ import {
   recordBotMessage,
 } from './lib/negotiation/state.js';
 import {
+  ABANDON_AFTER_MS,
   NEGOTIATION_ABANDON_JOB,
   NEGOTIATION_NUDGE_JOB,
   NEGOTIATION_SWEEP_JOB,
@@ -272,6 +273,7 @@ async function handleReminder(job: Job<ReminderJobData>): Promise<string> {
     goalTitle: goal.title,
     target: goal.target,
     targetUnit: goal.targetUnit,
+    description: goal.description,
     recentHistory: await recentHistoryFor(goalId, user.timezone),
   });
 
@@ -630,6 +632,22 @@ async function handleReconcile(): Promise<string> {
     .where(lt(pendingActions.expiresAt, now))
     .returning({ id: pendingActions.id });
 
+  // Negotiations whose abandon timer never fired. The timer lives only in
+  // Redis, so a wiped Redis (a lost VM, a volume deleted) would leave a
+  // proposal open forever — and since only one can be open per goal, that
+  // goal could never be renegotiated again. The timer is the fast path; this
+  // sweep is the guarantee, exactly as with reminder schedules.
+  const staleNegotiations = await db
+    .update(negotiations)
+    .set({ status: 'abandoned', closedAt: now, updatedAt: now })
+    .where(
+      and(
+        eq(negotiations.status, 'proposed'),
+        lt(negotiations.lastMessageAt, new Date(now.getTime() - ABANDON_AFTER_MS)),
+      ),
+    )
+    .returning({ id: negotiations.id });
+
   // Old chat turns. Unlike memories — which are kept forever on purpose —
   // the raw conversation is working state: it exists to resolve "it" and
   // "that one" within a conversation, and a month-old exchange can no longer
@@ -655,6 +673,7 @@ async function handleReconcile(): Promise<string> {
     `synced ${activeGoals.length} goal(s), removed ${removed} orphaned scheduler(s), ` +
     `swept ${expiredCodes.length} expired code(s), ${expiredDrafts.length} expired draft(s) ` +
     `and ${oldTurns.length} old chat turn(s), ` +
+    `closed ${staleNegotiations.length} stale negotiation(s), ` +
     `re-queued ${unembedded.length} unembedded memor(ies)`
   );
 }

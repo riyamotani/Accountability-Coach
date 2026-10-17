@@ -1,6 +1,6 @@
 import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
-import { and, asc, count, eq, gt, gte, lte } from 'drizzle-orm';
+import { and, asc, count, eq, gt, gte, lt, lte } from 'drizzle-orm';
 import { daysBetween, formatLocalDate, localDateInZone, type CheckInStatus } from '@coach/shared';
 import { db } from '../db/client.js';
 import {
@@ -81,6 +81,13 @@ const goalFieldsSchema = z.object({
   targetUnit: z.string().trim().max(32).optional(),
 });
 
+/**
+ * A cap on goals per draft. One message might reasonably set up a morning and
+ * an evening slot, or a few related habits; much beyond that is more likely a
+ * model misreading the request than a person asking for it.
+ */
+const MAX_GOALS_PER_DRAFT = 5;
+
 const goalUpdateSchema = goalFieldsSchema.partial().extend({ goalId: z.string().uuid() });
 const goalIdSchema = z.object({ goalId: z.string().uuid(), title: z.string().optional() });
 
@@ -141,22 +148,51 @@ async function findOwnScheduleBlock(blockId: string, userId: string) {
   return block;
 }
 
+/**
+ * Saves a draft, and says so LOUDLY if it replaced another one.
+ *
+ * One draft per user is deliberate (a stale draft must never be confirmable
+ * by accident), so a second proposal replaces the first. That used to happen
+ * silently — seen live: asked for "9 PM for 1 hour AND 6:30 AM for 2 hours",
+ * the model drafted both, the second replaced the first, the user confirmed,
+ * only the 6:30 goal was created, and the bot announced that "both" were set.
+ * The model couldn't have known. The code did, so the code has to say it.
+ *
+ * The returned object is spread into every propose tool's result, so the
+ * model sees `replacedDraft` in the same breath as `drafted: true`.
+ */
 async function setPendingAction(
   userId: string,
   kind: PendingActionKind,
   payload: PendingActionPayload,
-): Promise<void> {
+): Promise<{ replacedDraft?: { kind: string; payload: unknown }; note_about_drafts?: string }> {
   const expiresAt = new Date(Date.now() + PENDING_ACTION_TTL_MS);
+
+  const previous = await findLivePendingAction(userId);
 
   // INSERT ... ON CONFLICT (user_id) DO UPDATE: one draft per user, and a new
   // proposal REPLACES any older one rather than piling up beside it.
   await db
     .insert(pendingActions)
-    .values({ userId, kind, payload, expiresAt })
+    // createdAt is set from the API's clock, NOT the database's `now()`: it is
+    // compared against the API's own turnStartedAt, and two machines' clocks
+    // can disagree by enough to make a same-turn draft look older than it is.
+    .values({ userId, kind, payload, expiresAt, createdAt: new Date() })
     .onConflictDoUpdate({
       target: pendingActions.userId,
       set: { kind, payload, expiresAt, createdAt: new Date() },
     });
+
+  if (!previous) return {};
+  return {
+    replacedDraft: { kind: previous.kind, payload: previous.payload },
+    note_about_drafts:
+      'This REPLACED an earlier unconfirmed draft, which is now gone. Only ONE draft can ' +
+      'exist at a time. To create several goals, put them ALL in a single proposeGoal ' +
+      'call — one draft, one confirmation. If the earlier draft held something different ' +
+      'the user still wants, tell them it was replaced. Never say something was created ' +
+      'unless confirmPendingAction returned it.',
+  };
 }
 
 /**
@@ -210,7 +246,7 @@ function withRepeatGuard(tools: ToolSet): ToolSet {
  * decline. Built separately so they can be withheld entirely when no
  * proposal is waiting.
  */
-function negotiationTools(userId: string): ToolSet {
+function negotiationTools(userId: string, turnStartedAt: Date): ToolSet {
   return {
     acceptNegotiation: tool({
       description:
@@ -221,6 +257,18 @@ function negotiationTools(userId: string): ToolSet {
       execute: async () => {
         const open = await findOpenNegotiation(userId);
         if (!open) return { applied: false, error: 'There is no open proposal to accept.' };
+
+        // The terms being accepted must be ones the user has SEEN. If the
+        // proposal was changed during this very turn (a counter-offer the
+        // model just recorded), the user hasn't agreed to the new version.
+        if (open.lastMessageAt >= turnStartedAt) {
+          return {
+            applied: false,
+            error:
+              'These terms were set in this same turn and the user has not seen them yet. ' +
+              'Read them back and ask the user to confirm. Do NOT say it is done.',
+          };
+        }
 
         // Read from the STORED proposal, never from anything the model
         // passes in. Even a model that misreads "no, not that" as agreement
@@ -356,13 +404,28 @@ export interface ToolContext {
    * doing something is not to offer it.
    */
   hasOpenNegotiation: boolean;
+
+  /**
+   * When THIS request began. A draft or proposal created at or after this
+   * moment was made during the current turn, so the user has not seen it yet
+   * and cannot have agreed to it.
+   *
+   * This is what actually enforces "nothing is written until a human says
+   * yes". It used to be enforced only by a tool description ("call this ONLY
+   * when the user confirms"), which is a prompt — and a capable model, asked
+   * to "add a goal", drafted it and confirmed it in the same breath, telling
+   * the user it was done before they had seen it. Being helpful is exactly
+   * the failure mode here, so the rule has to live in code.
+   */
+  turnStartedAt: Date;
 }
 
 export function buildAssistantTools(
   userId: string,
   timezone: string,
-  context: ToolContext = { hasOpenNegotiation: false },
+  context: ToolContext = { hasOpenNegotiation: false, turnStartedAt: new Date() },
 ): ToolSet {
+  const { turnStartedAt } = context;
   return withRepeatGuard({
     getGoals: tool({
       description: "List the user's active goals, with their schedule and target.",
@@ -379,6 +442,10 @@ export function buildAssistantTools(
           timeOfDay: g.timeOfDay,
           target: g.target,
           targetUnit: g.targetUnit,
+          // The user's reason for the goal. Without it the assistant knows
+          // WHAT they're doing but never WHY — and "why" is what makes
+          // encouragement or a suggested change actually land.
+          ...(g.description ? { why: g.description } : {}),
         }));
       },
     }),
@@ -454,9 +521,9 @@ export function buildAssistantTools(
         // the model can correct itself while the user is still in the chat.
         if (from > to) return { drafted: false, error: '`from` must be on or before `to`.' };
 
-        await setPendingAction(userId, 'pauseWindow', { from, to, reason });
+        const draft = await setPendingAction(userId, 'pauseWindow', { from, to, reason });
         return {
-          drafted: true,
+          drafted: true, ...draft,
           from,
           to,
           reason,
@@ -512,9 +579,9 @@ export function buildAssistantTools(
           };
         }
 
-        await setPendingAction(userId, 'checkIn', { goalId, date, status, note });
+        const draft = await setPendingAction(userId, 'checkIn', { goalId, date, status, note });
         return {
-          drafted: true,
+          drafted: true, ...draft,
           goalTitle: goal.title,
           date,
           // Handed to the model already formatted, so its reply can name the
@@ -534,44 +601,93 @@ export function buildAssistantTools(
      * be reachable from a message. Each one drafts; nothing is written until
      * the user confirms in their own next message.
      */
+    /**
+     * Takes a LIST of goals, drafted together and confirmed with one "yes".
+     *
+     * There can only ever be one draft per user — that rule stays, because a
+     * stale draft must never be confirmable by accident. But a draft holding a
+     * single goal turned "9 PM for an hour AND 6:30 AM for two hours" into
+     * either a silently lost goal or three rounds of "confirm this one, now
+     * that one". One draft, many goals, one confirmation, one transaction.
+     */
     proposeGoal: tool({
       description:
-        'Draft a NEW goal for the user to confirm. Ask for anything missing before calling: ' +
-        'a title, which days, and a time. daysOfWeek is 0=Sunday..6=Saturday ' +
-        '("weekdays" = [1,2,3,4,5], "every day" = [0,1,2,3,4,5,6]). timeOfDay is 24-hour "HH:mm" ' +
-        '(6pm = "18:00"). target/targetUnit are optional, e.g. 30 + "minutes".',
-      inputSchema: goalFieldsSchema,
-      execute: async (fields) => {
-        await setPendingAction(userId, 'goalCreate', fields);
+        'Draft one or MORE new goals for the user to confirm in a single step. Put every goal ' +
+        'they asked for in ONE call (e.g. "9 PM for 1 hour and 6:30 AM for 2 hours" = two ' +
+        'entries). Ask for anything missing first: a title, which days, a time. daysOfWeek is ' +
+        '0=Sunday..6=Saturday ("weekdays" = [1,2,3,4,5], "every day" = [0,1,2,3,4,5,6]). ' +
+        'timeOfDay is 24-hour "HH:mm" (6pm = "18:00"). target/targetUnit are optional, e.g. ' +
+        '30 + "minutes". When the same activity has two times, give each a distinguishing ' +
+        'title (e.g. "Prep for job switch (evening)").',
+      inputSchema: z.object({ goals: z.array(goalFieldsSchema).min(1).max(MAX_GOALS_PER_DRAFT) }),
+      execute: async ({ goals: drafted }) => {
+        // Duplicate guard. Seen live: right after two goals were created, the
+        // user said "yeah reminders work" and the model drafted the SAME two
+        // goals again — one more "yes" and there would have been four. An
+        // active goal with an identical title (case and spacing ignored) is
+        // almost certainly the same goal, so the draft is refused and the
+        // model is told what already exists.
+        const normalise = (title: string) => title.trim().replace(/\s+/g, ' ').toLowerCase();
+        const existing = await db
+          .select({ title: goals.title })
+          .from(goals)
+          .where(and(eq(goals.ownerId, userId), eq(goals.status, 'active')));
+        const existingTitles = new Set(existing.map((goal) => normalise(goal.title)));
+        const duplicates = drafted.filter((goal) => existingTitles.has(normalise(goal.title)));
+
+        if (duplicates.length > 0) {
+          return {
+            drafted: false,
+            error:
+              `These goals already exist and are active: ${duplicates.map((g) => `"${g.title}"`).join(', ')}. ` +
+              'Nothing was drafted. If the user wants to change one, use proposeGoalUpdate; if ' +
+              'they really want a second, separate goal, it needs a different title.',
+          };
+        }
+
+        const draft = await setPendingAction(userId, 'goalCreate', { goals: drafted });
         return {
-          drafted: true,
-          ...fields,
+          drafted: true, ...draft,
+          goals: drafted,
           note_to_model:
-            'Read the goal back in plain words (days and time as people say them) and ask ' +
-            'them to confirm.',
+            'Read ALL of them back in plain words (days and time as people say them) and ask ' +
+            'for ONE confirmation. A single yes creates every goal listed.',
         };
       },
     }),
 
+    /**
+     * A LIST of changes, one draft, one confirmation — for the same reason
+     * proposeGoal takes a list. Seen live: "add this description to both job
+     * goals" drafted the first update, then drafted the second (replacing
+     * the first — one draft per user), and ran out of steps without a reply.
+     */
     proposeGoalUpdate: tool({
       description:
-        'Draft a CHANGE to an existing goal (rename, different days, different time, new ' +
-        'target) for the user to confirm. Call getGoals first for the goalId. Only include ' +
-        'the fields that should change.',
-      inputSchema: goalUpdateSchema,
-      execute: async ({ goalId, ...changes }) => {
-        const goal = await findOwnGoal(goalId, userId);
-        if (!goal) return { drafted: false, error: 'No goal with that id belongs to this user.' };
-        if (Object.keys(changes).length === 0) {
-          return { drafted: false, error: 'Nothing to change — include at least one field.' };
+        'Draft CHANGES to one or MORE existing goals (rename, days, time, target, or a ' +
+        'description of WHY the goal matters) for the user to confirm in one step. Put every ' +
+        'goal being changed in ONE call. Call getGoals first for the goalIds. Only include the ' +
+        'fields that should change for each.',
+      inputSchema: z.object({ updates: z.array(goalUpdateSchema).min(1).max(MAX_GOALS_PER_DRAFT) }),
+      execute: async ({ updates }) => {
+        const summaries: Array<{ goalTitle: string; changes: Record<string, unknown> }> = [];
+        for (const { goalId, ...changes } of updates) {
+          const goal = await findOwnGoal(goalId, userId);
+          if (!goal) {
+            return { drafted: false, error: `No goal with id ${goalId} belongs to this user.` };
+          }
+          if (Object.keys(changes).length === 0) {
+            return { drafted: false, error: `Nothing to change for "${goal.title}".` };
+          }
+          summaries.push({ goalTitle: goal.title, changes });
         }
 
-        await setPendingAction(userId, 'goalUpdate', { goalId, ...changes });
+        const draft = await setPendingAction(userId, 'goalUpdate', { updates });
         return {
-          drafted: true,
-          goalTitle: goal.title,
-          changes,
-          note_to_model: 'Say what will change (before → after) and ask them to confirm.',
+          drafted: true, ...draft,
+          updates: summaries,
+          note_to_model:
+            'Say what will change for each goal (before → after) and ask for ONE confirmation.',
         };
       },
     }),
@@ -586,9 +702,9 @@ export function buildAssistantTools(
         const goal = await findOwnGoal(goalId, userId);
         if (!goal) return { drafted: false, error: 'No goal with that id belongs to this user.' };
 
-        await setPendingAction(userId, 'goalArchive', { goalId, title: goal.title });
+        const draft = await setPendingAction(userId, 'goalArchive', { goalId, title: goal.title });
         return {
-          drafted: true,
+          drafted: true, ...draft,
           goalTitle: goal.title,
           note_to_model:
             'Tell them reminders will stop but their history stays, and ask them to confirm.',
@@ -614,9 +730,9 @@ export function buildAssistantTools(
           .from(checkIns)
           .where(eq(checkIns.goalId, goalId));
 
-        await setPendingAction(userId, 'goalDelete', { goalId, title: goal.title });
+        const draft = await setPendingAction(userId, 'goalDelete', { goalId, title: goal.title });
         return {
-          drafted: true,
+          drafted: true, ...draft,
           goalTitle: goal.title,
           checkInsToDelete: historyCount,
           note_to_model:
@@ -633,9 +749,9 @@ export function buildAssistantTools(
         'means it crosses midnight (sleep 23:00-07:00).',
       inputSchema: scheduleBlockFieldsSchema,
       execute: async (fields) => {
-        await setPendingAction(userId, 'scheduleBlockCreate', fields);
+        const draft = await setPendingAction(userId, 'scheduleBlockCreate', fields);
         return {
-          drafted: true,
+          drafted: true, ...draft,
           ...fields,
           note_to_model: 'Read it back in plain words and ask them to confirm.',
         };
@@ -654,8 +770,8 @@ export function buildAssistantTools(
           return { drafted: false, error: 'Nothing to change — include at least one field.' };
         }
 
-        await setPendingAction(userId, 'scheduleBlockUpdate', { blockId, ...changes });
-        return { drafted: true, label: block.label, changes, note_to_model: 'Ask them to confirm.' };
+        const draft = await setPendingAction(userId, 'scheduleBlockUpdate', { blockId, ...changes });
+        return { drafted: true, ...draft, label: block.label, changes, note_to_model: 'Ask them to confirm.' };
       },
     }),
 
@@ -667,8 +783,8 @@ export function buildAssistantTools(
         const block = await findOwnScheduleBlock(blockId, userId);
         if (!block) return { drafted: false, error: 'No schedule block with that id.' };
 
-        await setPendingAction(userId, 'scheduleBlockDelete', { blockId, label: block.label });
-        return { drafted: true, label: block.label, note_to_model: 'Ask them to confirm.' };
+        const draft = await setPendingAction(userId, 'scheduleBlockDelete', { blockId, label: block.label });
+        return { drafted: true, ...draft, label: block.label, note_to_model: 'Ask them to confirm.' };
       },
     }),
 
@@ -689,13 +805,34 @@ export function buildAssistantTools(
           // update), only one DELETE can remove the row; the other gets
           // nothing back and commits nothing. A read-then-delete would let
           // both read it first and both write.
+          //
+          // `createdAt < turnStartedAt` is the human-in-the-loop guarantee:
+          // only a draft made in an EARLIER request — one the user has
+          // actually seen — can be confirmed. A draft from this same turn is
+          // left exactly where it is, waiting for a real answer.
           const [pending] = await tx
             .delete(pendingActions)
             .where(
-              and(eq(pendingActions.userId, userId), gt(pendingActions.expiresAt, new Date())),
+              and(
+                eq(pendingActions.userId, userId),
+                gt(pendingActions.expiresAt, new Date()),
+                lt(pendingActions.createdAt, turnStartedAt),
+              ),
             )
             .returning();
           if (!pending) {
+            // Tell the model WHY, so it does the right thing next instead of
+            // retrying: a fresh draft needs showing, a missing one doesn't.
+            const fresh = await findLivePendingAction(userId);
+            if (fresh) {
+              return {
+                committed: false,
+                error:
+                  'You created this draft in this same turn — the user has not seen it, so it ' +
+                  'cannot be confirmed yet. Show them what you drafted and ask them to confirm. ' +
+                  'Do NOT say it is done.',
+              };
+            }
             return {
               committed: false,
               error: 'Nothing is pending (or the draft expired). There is nothing to confirm.',
@@ -730,33 +867,82 @@ export function buildAssistantTools(
             }
 
             case 'goalCreate': {
-              const fields = goalFieldsSchema.parse(pending.payload);
-              const [goal] = await tx
+              // Current drafts hold { goals: [...] }. A draft saved by the
+              // previous version held a single goal's fields directly; drafts
+              // live 15 minutes, so a deploy can land in the middle of one —
+              // both shapes are accepted rather than failing that user.
+              const payload = pending.payload as { goals?: unknown };
+              const fieldsList = Array.isArray(payload.goals)
+                ? z.array(goalFieldsSchema).min(1).max(MAX_GOALS_PER_DRAFT).parse(payload.goals)
+                : [goalFieldsSchema.parse(pending.payload)];
+
+              // ONE insert with many rows, inside the transaction: all the
+              // goals are created or none are. Never "two of three".
+              const created = await tx
                 .insert(goals)
-                .values({ ...fields, ownerId: userId })
+                .values(fieldsList.map((fields) => ({ ...fields, ownerId: userId })))
                 .returning();
-              if (!goal) throw new Error('INSERT ... RETURNING returned no row');
-              // Redis gets the reminder schedule, exactly as POST /goals does.
-              // Not awaited and never throws: the goal is already saved, and
-              // the worker's sweep repairs a missed sync within minutes.
-              void syncGoalSchedule(goal);
-              return { committed: true, kind: pending.kind, title: goal.title };
+
+              // Redis gets each reminder schedule, exactly as POST /goals
+              // does. Not awaited and never throws: the goals are already
+              // saved, and the worker's sweep repairs a missed sync.
+              for (const goal of created) void syncGoalSchedule(goal);
+
+              // Exactly what was created, so the reply is built from facts
+              // rather than from what the model remembers drafting.
+              return {
+                committed: true,
+                kind: pending.kind,
+                created: created.map((goal) => ({
+                  title: goal.title,
+                  daysOfWeek: goal.daysOfWeek,
+                  timeOfDay: goal.timeOfDay,
+                  target: goal.target,
+                  targetUnit: goal.targetUnit,
+                })),
+                note_to_model: 'Describe exactly the goals listed in `created`, nothing more.',
+              };
             }
 
             case 'goalUpdate': {
-              const { goalId, ...changes } = goalUpdateSchema.parse(pending.payload);
-              const [goal] = await tx
-                .update(goals)
-                .set({ ...changes, updatedAt: new Date() })
-                // The ownership check again, at write time: the draft was
-                // created in an earlier request, and this is the statement
-                // that actually touches the row.
-                .where(and(eq(goals.id, goalId), eq(goals.ownerId, userId)))
-                .returning();
-              if (!goal) return { committed: false, error: 'That goal no longer exists.' };
+              // { updates: [...] } now; a single update's fields directly in
+              // drafts saved before that change (they live 15 minutes).
+              const payload = pending.payload as { updates?: unknown };
+              const updateList = Array.isArray(payload.updates)
+                ? z.array(goalUpdateSchema).min(1).max(MAX_GOALS_PER_DRAFT).parse(payload.updates)
+                : [goalUpdateSchema.parse(pending.payload)];
+
+              const updated = [];
+              for (const { goalId, ...changes } of updateList) {
+                const [goal] = await tx
+                  .update(goals)
+                  .set({ ...changes, updatedAt: new Date() })
+                  // The ownership check again, at write time: the draft was
+                  // created in an earlier request, and this is the statement
+                  // that actually touches the row.
+                  .where(and(eq(goals.id, goalId), eq(goals.ownerId, userId)))
+                  .returning();
+                // One goal gone means the user agreed to a set that no longer
+                // exists. Throwing rolls back the WHOLE transaction — none of
+                // the changes apply, rather than some of them.
+                if (!goal) throw new Error(`goal ${goalId} no longer exists`);
+                updated.push(goal);
+              }
+
               // A new time or new days means the old alarm is wrong.
-              void syncGoalSchedule(goal);
-              return { committed: true, kind: pending.kind, title: goal.title };
+              for (const goal of updated) void syncGoalSchedule(goal);
+              return {
+                committed: true,
+                kind: pending.kind,
+                updated: updated.map((goal) => ({
+                  title: goal.title,
+                  daysOfWeek: goal.daysOfWeek,
+                  timeOfDay: goal.timeOfDay,
+                  target: goal.target,
+                  description: goal.description,
+                })),
+                note_to_model: 'Describe exactly the changes listed in `updated`, nothing more.',
+              };
             }
 
             case 'goalArchive': {
@@ -932,7 +1118,7 @@ export function buildAssistantTools(
      * the model cannot quietly apply something other than what the user was
      * shown, even if it misreads the conversation.
      */
-    ...(context.hasOpenNegotiation ? negotiationTools(userId) : {}),
+    ...(context.hasOpenNegotiation ? negotiationTools(userId, turnStartedAt) : {}),
 
     cancelPendingAction: tool({
       description: "Discard the user's currently pending drafted action without committing it.",
